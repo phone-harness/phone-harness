@@ -75,6 +75,8 @@ The agent installs the CLI, asks which phone to use, and walks you through the s
 
 **OpenClaw:** `openclaw plugins install clawhub:phone-harness`. See [integrations/openclaw](integrations/openclaw/README.md).
 
+**Grok Build:** `grok plugin install phone-harness --trust` once the plugin is listed in the Grok Build marketplace. The plugin directory is [integrations/grok-build](integrations/grok-build/README.md). Hosted MCP for Phone Harness Cloud, and the `phone-harness` CLI through Grok's shell for a mirrored iPhone or an Android over adb.
+
 ## Usage
 
 ```bash
