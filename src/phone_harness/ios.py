@@ -23,6 +23,7 @@ getting a plausible wrong answer.
 """
 import importlib
 import os
+import re
 
 from . import ocr as _vision
 from .transport import Backend
@@ -123,7 +124,7 @@ class IPhone(Backend):
     # No _nav_back: iOS has no system Back button.
 
     def _apps_launch(self, name):
-        """Spotlight (Cmd+3): type the name, let results populate, commit."""
+        """Spotlight (Cmd+3): type the name, check what Return will do, commit."""
         self.mirror.press("cmd+3")
         _sleep(0.9)
         # Keystrokes on purpose: Spotlight is the load-bearing path behind
@@ -131,8 +132,27 @@ class IPhone(Backend):
         # that path has miles on it.
         self.mirror.type_text(name, keystrokes=True)
         _sleep(1.2)
+        title, action = self._spotlight_top_hit(name)
+        if action is not None and not _has_word(action, "open"):
+            self.mirror.press("cmd+1")
+            raise RuntimeError(
+                f"open_app({name!r}): no installed app matched. Spotlight "
+                f"offered {title!r} - {action!r} instead, so nothing was "
+                "launched.")
         self.mirror.press("return")
         return name
+
+    def _spotlight_top_hit(self, name, tries=3):
+        """(title, action) from the search field, e.g. ('Settings', 'Open')
+        or ('Notes', 'Ask Siri'). (None, None) when the field can't be read;
+        the caller then launches as before."""
+        for i in range(tries):
+            if i:
+                _sleep(0.6)
+            hit = _top_hit(self._screen_text(), name)
+            if hit:
+                return hit
+        return None, None
 
     # --- session --------------------------------------------------------
 
@@ -517,6 +537,19 @@ def _blocked_guidance(said):
         return ("This needs you: the Mac is asking for Touch ID or a password. "
                 "Approve it or cancel it. I never type a password.")
     return "This needs you: clear this on the Mac."
+
+
+_HIT = re.compile(r"^(.*\S)\s+[-\u2013\u2014]\s+(\S.*)$")
+
+
+def _top_hit(boxes, name):
+    """The search field reads '<completed title> - <what Return does>'. It is
+    the topmost line of that shape whose title starts with what was typed."""
+    for box in sorted(boxes, key=lambda b: b["y"]):
+        m = _HIT.match(box["text"].strip())
+        if m and m.group(1).lower().startswith(name.strip().lower()):
+            return m.group(1), m.group(2)
+    return None
 
 
 def _has_word(text, word):
