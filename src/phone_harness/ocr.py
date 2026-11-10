@@ -27,6 +27,7 @@ def recognize(path, window):
         NSURL.fileURLWithPath_(path), None)
     request = Vision.VNRecognizeTextRequest.alloc().init()
     request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    request.setRecognitionLanguages_(["ko-KR", "en-US"])
     ok, err = handler.performRequests_error_([request], None)
     if not ok:
         raise RuntimeError(f"Vision OCR failed: {err}")
