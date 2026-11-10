@@ -681,6 +681,12 @@ def _store_session(record, make_attached=True):
     telemetry.note_session(record["sid"], record.get("platform"))
     state = _load_state()
     sessions = _known_sessions(state)
+    previous = sessions.get(record["sid"])
+    # `cloud use` refreshes the server record without a catalog choice.
+    # Keep that same session's selector so the next start can reuse it;
+    # all server fields (including link credentials and expiry) stay fresh.
+    if record.get("selector") is None and isinstance(previous, dict):
+        record = {**record, "selector": previous.get("selector")}
     sessions[record["sid"]] = record
     state["sessions"] = sessions
     if make_attached or not isinstance(state.get("session"), dict):
