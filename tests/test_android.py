@@ -13,9 +13,10 @@ from phone_harness.android import Android, TreeUnavailable  # noqa: E402
 class Recorded(Android):
     """An Android whose adb shell is a list."""
 
-    def __init__(self, installed=(), fail_motionevent=False, dumps=()):
+    def __init__(self, installed=(), fail_motionevent=False, dumps=(), hidden=()):
         super().__init__()
         self.sent, self.installed, self.fail_motionevent = [], list(installed), fail_motionevent
+        self.hidden = set(hidden)
         self.dumps, self.dump_calls, self.shots = list(dumps), 0, 0
         self._bounds = {"x": 0, "y": 0, "w": 720, "h": 1280, "id": "fake"}
         self._resolved = True
@@ -50,6 +51,8 @@ class Recorded(Android):
         if cmd.startswith("pm list packages"):
             return "\n".join(f"package:{p}" for p in self.installed)
         if cmd.startswith("cmd package resolve-activity"):
+            if cmd.split()[-1] in self.hidden:
+                return "No activity found"
             return f"priority=0\n{cmd.split()[-1]}/.Main"
         return ""
 
@@ -138,6 +141,32 @@ class Launch(unittest.TestCase):
                 got, last = self.launched(name)
                 self.assertEqual(got, pkg)
                 self.assertEqual(last, f"am start -W -n {pkg}/.Main")
+
+    # Packages matching "settings" on a Galaxy S24 (#203).
+    SAMSUNG = ["com.sec.usbsettings", "com.android.settings", "com.sec.modem.settings",
+               "com.android.providers.settings", "com.android.settings.intelligence",
+               "com.samsung.android.settingshelper", "com.samsung.android.settings",
+               "com.samsung.android.settings.ia"]
+
+    def test_a_name_skips_packages_that_cannot_be_launched(self):
+        hidden = set(self.SAMSUNG) - {"com.android.settings"}
+        phone = Recorded(self.SAMSUNG, hidden=hidden)
+        self.assertEqual(phone._apps_launch("Settings"), "com.android.settings")
+        self.assertEqual(phone.sent[-1], "am start -W -n com.android.settings/.Main")
+
+    def test_a_name_matching_only_hidden_packages_falls_back_to_the_label(self):
+        phone = Recorded(self.SAMSUNG, hidden=self.SAMSUNG)
+        with unittest.mock.patch.object(phone, "_launch_by_label",
+                                        return_value="com.vendor.settings") as by_label:
+            self.assertEqual(phone._apps_launch("Settings"), "com.vendor.settings")
+        by_label.assert_called_once_with("Settings")
+        self.assertFalse([c for c in phone.sent if c.startswith("am start")])
+
+    def test_an_exact_id_that_cannot_be_launched_still_says_so(self):
+        phone = Recorded(self.SAMSUNG, hidden=["com.sec.usbsettings"])
+        with self.assertRaises(RuntimeError) as cm:
+            phone._apps_launch("com.sec.usbsettings")
+        self.assertIn("com.sec.usbsettings has no launchable activity", str(cm.exception))
 
 
 class ResolvePrimary(unittest.TestCase):

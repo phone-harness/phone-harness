@@ -531,11 +531,17 @@ class Android(Backend):
         want = re.sub(r"[^a-z0-9]+", "", name.lower())
         pkg = name if name in pkgs else next(
             (p for p in _APP_IDS.get(want, ()) if p in pkgs), None)
+        comp = None
         if pkg is None:
             hits = [p for p in pkgs if want and want in p.lower().replace(".", "")]
             # shortest match is the least-qualified, e.g. com.android.chrome
-            # over com.android.chrome.helper
-            pkg = sorted(hits, key=len)[0] if hits else None
+            # over com.android.chrome.helper. Hidden system packages match
+            # too (Samsung: "settings" -> com.sec.usbsettings), so skip those.
+            for hit in sorted(hits, key=len):
+                comp = self._launcher_activity(hit)
+                if comp:
+                    pkg = hit
+                    break
         if pkg is None:
             launched = self._launch_by_label(name)
             if launched:
@@ -544,14 +550,18 @@ class Android(Backend):
                 f"no installed app matches {name!r}. Installed: "
                 f"{', '.join(self._apps_list()) or 'no third-party apps'}. "
                 "Pass one of these package ids.")
-        out = self._sh("cmd package resolve-activity --brief "
-                       f"-c android.intent.category.LAUNCHER {shlex.quote(pkg)}")
-        comp = next((l.strip() for l in reversed(out.splitlines())
-                     if "/" in l), None)
+        comp = comp or self._launcher_activity(pkg)
         if comp is None:
             raise RuntimeError(f"{pkg} has no launchable activity")
         self._sh(f"am start -W -n {shlex.quote(comp)}")
         return pkg
+
+    def _launcher_activity(self, pkg):
+        """-> 'package/activity' for the icon `pkg` puts on the launcher, or None."""
+        out = self._sh("cmd package resolve-activity --brief "
+                       f"-c android.intent.category.LAUNCHER {shlex.quote(pkg)}")
+        return next((l.strip() for l in reversed(out.splitlines())
+                     if "/" in l), None)
 
     def _launch_by_label(self, name):
         """Tap the icon labelled `name` on the home screen, else in the app
