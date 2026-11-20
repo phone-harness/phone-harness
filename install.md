@@ -122,6 +122,10 @@ Set up each as above; `phone-harness config set platform …` picks the default,
 the iPhone is driven through the mirroring window, the Android over adb. A
 cloud iPhone is a third path: HTTPS ops, covered in the skill.
 
+A phone set to another language needs OCR to read that language:
+`phone-harness config set ocr.languages "ko-KR,en-US"`, with the phone's
+language first. Unset, it follows the Mac's preferred languages.
+
 `phone-harness config set telemetry false` turns off usage telemetry, and so does
 `DO_NOT_TRACK=1` or `PHONE_HARNESS_TELEMETRY=0` in the environment. Under Hermes it
 is off unless you opt in with `phone-harness config set telemetry true`. Once you

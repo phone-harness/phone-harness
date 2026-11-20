@@ -454,6 +454,13 @@ events into it for hands. All coordinates are global macOS screen points.
   the length of the gesture and hands focus straight back. Expect a brief
   flicker on scrolls and nothing on anything else. `PHONE_HARNESS_BACKGROUND=0`
   forces the classic path, which focuses before every action.
+- **A phone in another language:** Vision reads in the Mac's languages by
+  default. If `screen()` returns Latin gibberish or misses labels a screenshot
+  shows, run
+  `phone-harness config set ocr.languages "zh-Hans,en-US"` with the phone's
+  language **first** (Vision reads with the first one's script), or pass
+  `PHONE_HARNESS_OCR_LANGUAGES` for one call. The same setting covers
+  Android's Vision fallback on a Mac.
 - **Icons without labels:** `screenshot()`, view the image, and use
   `tap_image_point(x, y, image_size=...)` with coordinates measured in the
   screenshot. Do **not** pass screenshot pixel coordinates to `tap()`: it

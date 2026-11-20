@@ -91,6 +91,9 @@ DEFAULTS = {
         "restore_clipboard": False,   # put the old clipboard back after a paste
         "paste_settle": 2.0,          # ...after this many seconds, if so
     },
+    "ocr": {
+        "languages": "",       # Vision OCR languages, e.g. "zh-Hans,en-US"; empty = the Mac's languages plus English
+    },
 }
 
 # Settings that historically had their own environment variable.
