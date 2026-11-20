@@ -1,0 +1,24 @@
+{
+  "name": "phone-harness",
+  "description": "Drive a Phone Harness phone from Grok Build. Hosted OAuth MCP for a Cloud Android or Cloud iPhone. The phone-harness CLI, through Grok's shell, for a mirrored iPhone, an Android over adb, or cloud when the user explicitly chooses that path.",
+  "category": "development",
+  "source": {
+    "source": "url",
+    "url": "https://github.com/phone-harness/phone-harness.git",
+    "sha": "d1416d89cd0f521ee8d56a4b242a8082fb691e21",
+    "path": "integrations/grok-build"
+  },
+  "homepage": "https://phone-harness.com",
+  "keywords": [
+    "phone harness",
+    "phone-harness",
+    "phone harness cloud",
+    "phone-harness mcp"
+  ],
+  "domains": [
+    "phone-harness.com",
+    "www.phone-harness.com",
+    "mcp.phone-harness.com",
+    "api.phone-harness.com"
+  ]
+}
