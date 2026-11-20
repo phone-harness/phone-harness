@@ -30,14 +30,14 @@ Select with PHONE_HARNESS_BACKGROUND=1. Coordinates use the same global
 screen-point convention as the mirror backend and screen(), so every helper on
 top (tap_text, swipe, scroll_collect) works unchanged — just without focus.
 
-Keyboard (type_text/press) still briefly activates the window: the keyboard
-event-record layout isn't implemented yet, so those fall back to the mirror
-path. Mouse actions are fully background.
+Keyboard (type_text/press) makes the app AppKit-active with an activate
+record, never the front process, so the user's own typing stays in their app.
 """
 import ctypes, ctypes.util, os, struct, subprocess, tempfile, time
 from contextlib import contextmanager
 from pathlib import Path
 
+import objc
 import Quartz
 from AppKit import NSRunningApplication
 
@@ -59,11 +59,10 @@ class _PSN(ctypes.Structure):
 
 _appserv.GetProcessForPID.argtypes = [ctypes.c_int, ctypes.POINTER(_PSN)]
 _appserv.GetProcessForPID.restype = ctypes.c_int
-_sky._SLPSSetFrontProcessWithOptions.argtypes = [
-    ctypes.POINTER(_PSN), ctypes.c_uint32, ctypes.c_uint32]
 _sky.SLPSPostEventRecordTo.argtypes = [ctypes.POINTER(_PSN), ctypes.c_void_p]
+_sky.SLEventGetEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+_sky.SLEventGetEventRecord.restype = ctypes.c_int
 
-_KCPS_USER_GENERATED = 0x200
 # CGSEventType values (share the CGEventType numbering)
 _LMOUSE_DOWN, _LMOUSE_UP, _LMOUSE_DRAGGED = 1, 2, 6
 
@@ -172,19 +171,23 @@ def _screencapture(win, path):
 
 # --- input (hands), no focus ---
 
+def _deliver(pid, wid, buf, gx, gy, lx, ly):
+    """Address an event record to the window and hand it to the process."""
+    struct.pack_into("<I", buf, 0x3c, wid)          # target window id
+    struct.pack_into("<dd", buf, 0x10, gx, gy)      # location (global points)
+    struct.pack_into("<dd", buf, 0x20, lx, ly)      # windowLocation (local)
+    psn = _PSN()
+    _appserv.GetProcessForPID(pid, ctypes.byref(psn))
+    _sky.SLPSPostEventRecordTo(ctypes.byref(psn), ctypes.byref(buf))
+
+
 def _post(pid, wid, etype, gx, gy, lx, ly):
     """Deliver one synthesized mouse event record to the process by pid."""
     buf = (ctypes.c_uint8 * 0xf8)()
     buf[0x04] = 0xf8                       # record length
     buf[0x3a] = 0x10                       # yabai's required flag byte
-    struct.pack_into("<I", buf, 0x3c, wid)          # target window id
-    struct.pack_into("<dd", buf, 0x10, gx, gy)      # location (global points)
-    struct.pack_into("<dd", buf, 0x20, lx, ly)      # windowLocation (local)
     buf[0x08] = etype
-    psn = _PSN()
-    _appserv.GetProcessForPID(pid, ctypes.byref(psn))
-    _sky._SLPSSetFrontProcessWithOptions(ctypes.byref(psn), wid, _KCPS_USER_GENERATED)
-    _sky.SLPSPostEventRecordTo(ctypes.byref(psn), ctypes.byref(buf))
+    _deliver(pid, wid, buf, gx, gy, lx, ly)
 
 
 def _ctx():
@@ -223,7 +226,7 @@ def drag(x1, y1, x2, y2, duration=0.35, steps=14):
 
 
 def scroll_wheel(dy, x, y, steps=6, dx=0):
-    """Scroll by borrowing the mouse pointer, not the focus.
+    """Scroll with an event record, like a tap: no pointer, no focus.
 
     macOS routes a scroll event to the window under the REAL cursor, not to the
     active application and not to the event's own location field. That single
@@ -235,69 +238,62 @@ def scroll_wheel(dy, x, y, steps=6, dx=0):
       - a wheel event posted with CGEventPostToPid does nothing, with or
         without the continuous/scroll-phase fields a real trackpad sets:
         posting to a pid bypasses the hit-testing that routes scrolls.
-      - a SkyLight scroll record (CGSEventType 22) over the channel the mouse
-        events use: nothing at any delta offset tried.
+      - a hand-built SkyLight scroll record (CGSEventType 22): nothing at any
+        delta offset tried. The wheel deltas sit further in than the mouse
+        fields, from 0x88 on macOS 26.6.
       - arrow keys, space and cmd+down over the working background key path:
         nothing; iOS lists don't scroll from those.
       - posting to the HID tap with only CGEventSetLocation set: nothing,
         because the cursor was elsewhere on screen.
 
-    So put the cursor over the window for the length of the gesture and put it
-    straight back. Mirroring does NOT need to be frontmost — verified scrolling
-    with Finder active throughout. Warping costs the user their pointer for
-    ~0.3s, which is a great deal cheaper than an activation, and immeasurably
-    cheaper than opening a random row in whatever app is on screen.
+    So don't guess the record layout: make a real scroll CGEvent and have
+    SLEventGetEventRecord serialize it, then deliver it like the mouse records.
+    That skips the cursor routing, so the pointer is never warped and the
+    window is never raised.
+
+    The record's location does not aim it. The phone scrolls whatever sits
+    under ITS pointer, which stays where the last touch left it: after a tap on
+    a tab bar, a scroll sent to the middle of the list moved nothing. A lone
+    mouse-up at (x, y) moves that pointer without touching the screen. A
+    mouse-moved record does not.
     """
-    _ctx()                       # window must exist; raises with a clear message
-
-    # A scroll goes to whatever window is under the cursor, so the phone window
-    # has to be the one on top at that point. It is not enough to move the
-    # pointer: with Chrome overlapping the mirroring window, the gesture was
-    # delivered to Chrome and silently scrolled the user's browser instead of
-    # the phone. Raise the window first, then give focus back.
-    from AppKit import NSWorkspace
-    prev = NSWorkspace.sharedWorkspace().frontmostApplication()
-    try:
-        mirror.activate()
-    except RuntimeError:
-        pass                     # not frontmost-able; the warp below may still win
-
-    # Refuse rather than scroll whatever the user just brought forward.
-    mirror.require_window_at(x, y)
-
-    home = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-    Quartz.CGWarpMouseCursorPosition(Quartz.CGPointMake(x, y))
+    pid, win = _ctx()            # window must exist; raises with a clear message
+    _emit(_LMOUSE_UP, x, y, pid, win)
     time.sleep(0.05)
-    # The warp moves the pointer but does NOT re-run the hit-test that decides
-    # which window a scroll belongs to. Without this event the scroll is
-    # delivered to whatever was under the cursor before, and nothing moves.
-    mv = Quartz.CGEventCreateMouseEvent(
-        None, Quartz.kCGEventMouseMoved, Quartz.CGPointMake(x, y), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, mv)
-    time.sleep(0.05)
-    try:
-        for _ in range(steps):
-            ev = Quartz.CGEventCreateScrollWheelEvent(
-                None, Quartz.kCGScrollEventUnitPixel, 2,
-                int(dy / steps), int(dx / steps))
-            Quartz.CGEventSetLocation(ev, Quartz.CGPointMake(x, y))
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.03)
-        time.sleep(0.15)         # let the pan land before the pointer leaves
-    finally:
-        Quartz.CGWarpMouseCursorPosition(home)
-        if prev is not None and prev.bundleIdentifier() != (
-                mirror.running_app() and mirror.running_app().bundleIdentifier()):
-            prev.activateWithOptions_(1 << 1)   # NSApplicationActivateIgnoringOtherApps
+    for _ in range(steps):
+        ev = Quartz.CGEventCreateScrollWheelEvent(
+            None, Quartz.kCGScrollEventUnitPixel, 2,
+            int(dy / steps), int(dx / steps))
+        buf = (ctypes.c_uint8 * 0xf8)()
+        if _sky.SLEventGetEventRecord(objc.pyobjc_id(ev), ctypes.byref(buf), 0xf8):
+            raise RuntimeError("could not serialize the scroll event")
+        _deliver(pid, win["id"], buf, x, y, x - win["x"], y - win["y"])
+        time.sleep(0.03)
 
 
-# --- keyboard (background), via make-key + CGEventPostToPid ---
+# --- keyboard (background), via activate + make-key + CGEventPostToPid ---
 #
 # Keyboard is delivered differently from mouse: the keystroke goes to the key
-# window's text responder. Making the window key (yabai's focus record: a
-# down/up pair with a blanked location) and then posting the key event to the
-# process by pid lands the text with no activation — verified by typing into
-# Spotlight while another app stayed frontmost.
+# window's text responder. Making the app AppKit-active and the window key
+# (yabai's focus record: a down/up pair with a blanked location) and then
+# posting the key event to the process by pid lands the text while another app
+# stays the front process — verified by typing into Spotlight.
+
+def _activate(pid, wid):
+    """Make iPhone Mirroring AppKit-active without making it the front process.
+
+    The app only handles keys while it believes it is active. Setting the front
+    process does that, and also sends everything the user types to the phone.
+    The window server's own "application activated" record does it alone: the
+    app runs applicationWillBecomeActive and takes keys posted by pid, while
+    the user's app keeps the front process and their keyboard.
+    """
+    buf = (ctypes.c_uint8 * 0xf8)()
+    buf[0x04] = 0xf8
+    buf[0x08] = 0x0d                    # AppKit-defined event
+    buf[0x8a] = 0x01                    # subtype: application activated
+    _deliver(pid, wid, buf, 0, 0, 0, 0)
+
 
 def _make_key(pid, wid):
     buf = (ctypes.c_uint8 * 0xf8)()
@@ -308,7 +304,6 @@ def _make_key(pid, wid):
         buf[0x20 + i] = 0xff            # blanked location => "focus", not a click
     psn = _PSN()
     _appserv.GetProcessForPID(pid, ctypes.byref(psn))
-    _sky._SLPSSetFrontProcessWithOptions(ctypes.byref(psn), wid, _KCPS_USER_GENERATED)
     buf[0x08] = _LMOUSE_DOWN
     _sky.SLPSPostEventRecordTo(ctypes.byref(psn), ctypes.byref(buf))
     buf[0x08] = _LMOUSE_UP
@@ -362,6 +357,7 @@ def press(combo):
     for m in mods:
         if m not in mirror._MOD_KEYCODES:
             raise ValueError(f"unknown modifier {m!r}")
+    _activate(pid, win["id"])
     with _holding(pid, win["id"], mods) as flags:
         _key(pid, win["id"], mirror._KEYCODES[key], flags)
 
@@ -370,6 +366,7 @@ def _type_keystrokes(text, delay=0.03):
     """Type via real keycodes, no focus change. Subject to iOS autocorrect,
     which rewrites words as they are typed."""
     pid, win = _ctx()
+    _activate(pid, win["id"])
     for i, line in enumerate(text.split("\n")):
         if i:
             _key(pid, win["id"], mirror._KEYCODES["return"])
