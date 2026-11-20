@@ -138,7 +138,10 @@ def capture(path=None, retries=2):
             Quartz.CGRectNull, Quartz.kCGWindowListOptionIncludingWindow,
             win["id"],
             Quartz.kCGWindowImageBoundsIgnoreFraming
-            | Quartz.kCGWindowImageNominalResolution)
+            # Backing-store (Retina) pixels, not points: at point resolution
+            # small text, Korean in particular, is too few pixels for Vision
+            # to read. Callers scale by the image size, so taps still land.
+            | Quartz.kCGWindowImageBestResolution)
         if img is not None and Quartz.CGImageGetWidth(img) > 0:
             url = Quartz.CFURLCreateWithFileSystemPath(
                 None, path, Quartz.kCFURLPOSIXPathStyle, False)
@@ -151,9 +154,8 @@ def capture(path=None, retries=2):
             # CGWindowListCreateImage renders nothing for a window that is not
             # on the active Space. `screencapture -l` still reaches it, with
             # live frames rather than a stale backing store. It costs a
-            # subprocess, so it stays the fallback. Its image is Retina where
-            # the fast path is point-resolution; ocr.recognize derives the
-            # scale from the window, so both work.
+            # subprocess, so it stays the fallback. Both paths give Retina
+            # pixels; ocr.recognize derives the scale from the window.
             return path, win
         else:
             last = "CGWindowListCreateImage returned nothing, screencapture failed"
