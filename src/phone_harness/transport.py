@@ -61,6 +61,25 @@ nothing in common — so the shared layer is this vocabulary instead.
         the harness has no such control, and a phone on the desk is one: its
         owner unlocks it.
 
+    device.rotate       to              -> {device, orientation, turned, lock}
+
+        Turns the phone to 'portrait', 'landscape_left' or 'landscape_right',
+        as if it had been turned in the hand. A cloud iPhone lies flat in a
+        rack, so this is the only way its screen turns. `device` is how the
+        phone is held afterwards and `orientation` how the screen is drawn,
+        which stays 'portrait' when what is in front does not turn. The
+        screen's size and every coordinate change with it. The two
+        landscapes are separate words on purpose: which way up the screen is
+        decides which way a swipe goes.
+
+        A phone with iOS's Portrait Orientation Lock on does not turn, so the
+        op turns the lock off first. That goes through Settings: it takes
+        about a minute and leaves the phone on its Home Screen. The lock
+        then stays off until a turn back to portrait, which puts it on
+        again when a turn was what switched it off. `lock` is 'off' or 'on'
+        when the call changed the lock, else None. Refused on a phone at its
+        lock screen. Unsupported where the harness has no such control.
+
     session.state                       -> backend-defined string, 'ready' when usable
     session.require                     -> bounds, or raise telling the USER what to do
     session.refocus                     -> None    (a no-op where nothing needs focus)
@@ -106,7 +125,7 @@ OP_NAMES = (
     "input.keys", "input.text",
     "nav.home", "nav.back", "nav.recents",
     "apps.launch", "apps.current", "apps.list",
-    "device.wake",
+    "device.wake", "device.rotate",
     "session.state", "session.require", "session.refocus", "session.detail",
     "focus.probe", "focus.diff",
     "url.open",

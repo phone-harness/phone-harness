@@ -48,6 +48,7 @@ no hardware and is always the fallback.
 - `open_app(name)` - Launch an app and return the app id that launched.
 - `open_url(url)` - Open an https link in the phone's browser, whole. Cloud phones only for now.
 - `wake()` - Wake a cloud iPhone that is asleep or on its lock screen. No passcode is typed. Cloud iPhones only.
+- `rotate(to)` - Turn a cloud iPhone to `"portrait"`, `"landscape_left"` or `"landscape_right"`. Cloud iPhones only.
 - `push_file(path)` - Send a file to the phone; it opens in the phone's browser under its own name. Cloud phones only for now.
 - `swipe(direction, distance=0.4, at=None)` - Flick. `direction` is finger motion: `"up"`, `"down"`, `"left"`, or `"right"`.
 - `scroll(direction="down", amount=0.3, at=None)` - Scroll. `direction` is the content to reveal: `"down"`, `"up"`, `"left"`, or `"right"`.
@@ -328,6 +329,29 @@ the user. Check `supports('device.wake')` first; an older host lists no such
 op, and its refusal is `The iPhone is locked. Unlock it on the phone ...`.
 There, `home()` is the one thing to try.
 
+**Which way up.** A cloud iPhone lies flat in a rack, so it does not turn by
+itself. `rotate("landscape_left")`, `rotate("landscape_right")` and
+`rotate("portrait")` turn it, as if it had been turned in the hand; the two
+landscapes are the two ways round. `screenshot()` and `screen()` show the
+screen as it is now: after a turn their size and every coordinate are new,
+so read the screen again before the next tap. `screen_info()["window"]` is
+the size to go by, because it comes from a fresh capture; `find_window()`
+can still report the size the session started with. An app that supports
+only one way up stays that way, and the capture is then the same size as
+before. `rotate()` returns `{device, orientation, turned, lock}`: `device` is
+how the phone is held now and `orientation` how the screen is drawn,
+`'portrait'` when what is in front did not turn. If iOS's Portrait
+Orientation Lock is on, `rotate()` turns it off first, because a phone with
+it on does not turn. That goes through Settings: it takes about a minute and
+leaves the phone on its Home Screen, so open the app again afterwards. The
+lock then stays off until a turn back to portrait, which puts it on again.
+`lock` is `'off'` or `'on'` when the call changed the lock, else `None`. A
+turn that does not come back may still be going, and the error says so: wait
+a minute and look at `screenshot()` before calling `rotate()` again, or a
+second turn runs under the first. A turn is refused on a phone at its lock
+screen (`wake()` first). Check `supports('device.rotate')` first; a host that
+cannot turn a phone lists no such op.
+
 The client posts `{"op", "kw"}` to `<control url>/op` and reads the host's
 list from `GET <control url>/ops` (`remote.py`). `supports(op)` is that list.
 `send` of an op the host did not list raises `Unsupported` before the POST
@@ -353,6 +377,7 @@ documents or decodes.
 | `apps.current` | | app id or None |
 | `apps.list` | `include_system` | `[app id]`. Timeout 90s. |
 | `device.wake` | | `{state, was, woke, through}`; `state` is `'ready'` when the phone takes input. Turns the screen on and gets past the lock screen and StandBy. Never types a passcode. |
+| `device.rotate` | `to` | `{device, orientation, turned, lock}`. `to` is `'portrait'`, `'landscape_left'` or `'landscape_right'`. `orientation` is how the screen is drawn afterwards. The screen's size and every coordinate change with it. Turns Portrait Orientation Lock off first when it is on; `lock` says what it did. Timeout 200s. |
 | `session.state` | | backend-defined string; `'ready'` when usable. A host that can wake the phone also says `'locked'`, `'standby'`, `'asleep'` or `'not-running'`. |
 | `session.require` | | bounds, or raise telling the user what to do |
 | `session.refocus` | | `None` here. The client does not call the host. |

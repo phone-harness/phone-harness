@@ -128,6 +128,48 @@ class SkillOutput(unittest.TestCase):
         self.assertIn("`wake()` wakes it and the step can run again", install)
         self.assertIn("set up with no passcode", install)
 
+    def test_skill_says_how_to_turn_a_cloud_iphone_and_that_coordinates_go_stale(self):
+        text = _skill_text()
+        self.assertIn('- `rotate(to)` - Turn a cloud iPhone to `"portrait"`, `"landscape_left"` or '
+                      '`"landscape_right"`. Cloud iPhones only.', text)
+        section = " ".join(text.split("\n## Cloud iPhone\n", 1)[1].split("\n## ", 1)[0].split())
+        for rule in (
+                "**Which way up.**", "lies flat in a rack, so it does not turn by itself",
+                '`rotate("landscape_left")`, `rotate("landscape_right")` and `rotate("portrait")`',
+                "after a turn their size and every coordinate are new, so read the screen again before the next tap",
+                '`screen_info()["window"]` is the size to go by',
+                "`find_window()` can still report the size the session started with",
+                "An app that supports only one way up stays that way",
+                "`rotate()` returns `{device, orientation, turned, lock}`",
+                # the lock is not a refusal: the turn deals with it, and says whether it is put back
+                "If iOS's Portrait Orientation Lock is on, `rotate()` turns it off first",
+                "goes through Settings: it takes about a minute and leaves the phone on its Home Screen",
+                "open the app again afterwards",
+                "The lock then stays off until a turn back to portrait, which puts it on again",
+                "`lock` is `'off'` or `'on'` when the call changed the lock",
+                "A turn that does not come back may still be going, and the error says so",
+                "look at `screenshot()` before calling `rotate()` again",
+                "A turn is refused on a phone at its lock screen (`wake()` first)",
+                "Check `supports('device.rotate')` first",
+                "| `device.rotate` | `to` | `{device, orientation, turned, lock}`."):
+            self.assertIn(rule, section)
+        for gone in ("raises `Portrait Orientation Lock is on`", "No helper turns the lock off", "stays upright"):
+            self.assertNotIn(gone, section)
+        root = Path(__file__).resolve().parents[1]
+        api = " ".join((root / "setup" / "api.md").read_text().split())
+        for rule in ('{"op":"device.rotate","kw":{"to":"landscape_left"}}', "portrait | landscape_left | landscape_right",
+                     "after a turn read them again: the size and every coordinate are new",
+                     "`screen.bounds` can still answer the size the session started with",
+                     "It answers `{device, orientation, turned, lock}`",
+                     "If iOS's Portrait Orientation Lock is on, the turn switches it off first",
+                     "takes about a minute, so allow the request that long",
+                     "If the request answers 502 first, the phone may still be turning",
+                     "The lock then stays off until a turn back to portrait, which puts it on again",
+                     "`device.wake`, `device.rotate` and `url.open`"):
+            self.assertIn(rule, api)
+        self.assertNotIn("orientation_locked", api)
+        self.assertNotIn("(`Portrait Orientation Lock is on`)", api)
+
     def test_screenshot_prints_the_path_it_returns(self):
         import contextlib
 

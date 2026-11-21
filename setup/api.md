@@ -36,6 +36,8 @@ curl -s -H "$C" -H 'Content-Type: application/json' \
   -d '{"op":"device.wake","kw":{}}' $CONTROL_URL/op   # wake it; "state" is "ready" when it takes input
 curl -s -H "$C" -H 'Content-Type: application/json' \
   -d '{"op":"url.open","kw":{"url":"https://example.com"}}' $CONTROL_URL/op  # open an https link in Safari
+curl -s -H "$C" -H 'Content-Type: application/json' \
+  -d '{"op":"device.rotate","kw":{"to":"landscape_left"}}' $CONTROL_URL/op   # portrait | landscape_left | landscape_right
 ```
 
 A cloud iPhone that has been left alone goes to sleep: its screen is off, or
@@ -48,11 +50,28 @@ ask the user for.
 `url.open` takes an https link only, of at most 4096 characters, with no
 spaces; a link is often a credential, so do not print it.
 
+`device.rotate` turns the phone, which lies flat in a rack and does not turn
+by itself. `screen.capture` and `screen.text` show the screen as it is now,
+so after a turn read them again: the size and every coordinate are new. Go by
+the size of the capture; `screen.bounds` can still answer the size the
+session started with. It answers `{device, orientation, turned, lock}`:
+`device` is how the phone is held now and `orientation` how the screen is
+drawn, which stays `"portrait"` when what is in front supports only one way
+up. If iOS's Portrait Orientation Lock is on, the turn switches it off first,
+because a phone with it on does not turn. That goes through Settings and
+takes about a minute, so allow the request that long, and expect the phone on
+its Home Screen afterwards. If the request answers 502 first, the phone may
+still be turning: wait a minute and read the screen before asking again. The
+lock then stays off until a turn back to portrait, which puts it on again.
+`lock` is `"off"` or `"on"` when the call changed the lock, else null. A turn
+is refused with 409 on a phone at its lock screen.
+
 The same `{"op", "kw"}` body can be posted to `$API/sessions/SID/op` with the
 API key in place of the control token; the MCP server drives a phone that way.
-That route serves the screen, input, navigation and app ops, `device.wake` and
-`url.open`. It answers a locked phone with 502 and no code, so there send
-`device.wake` when an op fails and the screen shows the lock screen.
+That route serves the screen, input, navigation and app ops, `device.wake`,
+`device.rotate` and `url.open`. It answers a locked phone with 502 and no
+code, so there send `device.wake` when an op fails and the screen shows the
+lock screen.
 
 Reserve an iPhone the account does not have yet, with a $20 per phone refundable
 deposit. Reservations are for iPhones only (with or without eSIM). Cloud

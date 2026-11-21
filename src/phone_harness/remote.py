@@ -34,6 +34,13 @@ LOCKED_CODE = "locked"
 WAKEABLE = ("locked", "standby")        # the states `session.state` gives such a phone
 LOCKED = ("the cloud iPhone is locked or asleep. Call wake() and run this step again. It has no passcode, "
           "so there is nothing to type and nothing to ask the user for")
+# A turn that did not come back may not have failed. One that has to change the
+# rotation lock takes about 46 s on the phone it was measured on, and the
+# gateway in front of the control URL waits 70 s; past that it answers 502 and
+# the host carries on. Asking again at once would start a second turn under the
+# first, so the caller is told to look first.
+STILL_TURNING = ("A turn that has to change the rotation lock first takes about a minute and may still be going: "
+                 "wait a minute, then look at screenshot() before calling rotate() again")
 
 
 def _cloud_phone_error():
@@ -218,6 +225,25 @@ class Remote(Backend):
 
     def _url_open(self, url):
         return self._op("url.open", timeout=60, url=url)
+
+    def _device_rotate(self, to):
+        # A phone with Portrait Orientation Lock on does not turn, so the host
+        # turns the lock off first, and puts it back on the next turn to
+        # portrait. Each goes through Settings and takes about a minute; the
+        # host says to allow two.
+        try:
+            return self._op("device.rotate", timeout=200, to=to)
+        except Unsupported:
+            raise
+        except RuntimeError as error:
+            # No answer in time is not a refusal. It is the gateway's 5xx, or
+            # this client's own wait running out. A refusal (a 4xx, a phone at
+            # its lock screen, a session that is gone) is passed on as it is.
+            status = getattr(error, "status", None)
+            unanswered = status is None and str(error).startswith("could not reach the cloud phone")
+            if unanswered or (status is not None and status >= 500):
+                raise RuntimeError(f"{error}. {STILL_TURNING}") from None
+            raise
 
     def _session_refocus(self):
         return None

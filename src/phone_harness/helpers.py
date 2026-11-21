@@ -569,6 +569,32 @@ def wake():
     return phone.send("device.wake")
 
 
+ORIENTATIONS = ("portrait", "landscape_left", "landscape_right")
+
+
+def rotate(to):
+    """Turn a cloud iPhone to 'portrait', 'landscape_left' or
+    'landscape_right', as if it had been turned in the hand. Returns {device,
+    orientation, turned, lock}: `device` is how the phone is held now,
+    `orientation` how the screen is drawn, which stays 'portrait' when what is
+    in front supports only one way up. The screen's size and every coordinate
+    change with a turn, so read the screen again before the next tap:
+    screenshot() and screen() show it as it is now.
+
+    If iOS's Portrait Orientation Lock is on, this turns it off first, because
+    a phone with it on does not turn. That goes through Settings: it takes
+    about a minute and leaves the phone on its Home Screen, so open the app
+    again afterwards. The lock then stays off until a turn back to portrait,
+    which puts it on again. `lock` is 'off' or 'on' when the call changed the
+    lock, else None. The phone has to be awake. Cloud iPhones only."""
+    if to not in ORIENTATIONS:
+        raise ValueError("rotate(to): to is 'portrait', 'landscape_left' or 'landscape_right', "
+                         f"not {to!r}")
+    if not phone.supports("device.rotate"):
+        raise transport.Unsupported("cloud iPhones only: rotate() needs a cloud iPhone whose host can turn it")
+    return phone.send("device.rotate", to=to)
+
+
 def back():
     """System Back. Unsupported on iPhone Mirroring — iOS has no Back button,
     and faking one with an edge swipe is indistinguishable from a real result.
