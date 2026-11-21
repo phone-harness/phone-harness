@@ -84,6 +84,7 @@ class FakeMirror:
         self.pressed = []
         self.activated = 0
         self.actions = []
+        self.combos = []
 
     def _advance(self):
         if len(self.frames) > 1:
@@ -150,6 +151,7 @@ class FakeMirror:
 
     def press(self, combo):
         self.actions.append("press")
+        self.combos.append(combo)
 
     def type_text(self, text, delay=0.03, keystrokes=False):
         self.actions.append("type")
@@ -165,9 +167,11 @@ class FakeMirror:
 
 
 class FakeVision:
-    @staticmethod
-    def recognize(path, win):
-        return []
+    boxes = []
+
+    @classmethod
+    def recognize(cls, path, win):
+        return list(cls.boxes)
 
 
 @unittest.skipIf(ios is None, "pyobjc not installed")
@@ -429,8 +433,38 @@ class SessionRequire(unittest.TestCase):
         self.assertEqual(
             p.mirror.actions,
             ["scroll", "tap", "long_press", "drag", "press", "type",
-             "press", "press", "type", "press", "capture"])
+             "press", "press", "type", "capture", "capture", "capture",
+             "press", "capture"])
         self.assertEqual(p.mirror.pressed, [])
+
+    def spotlight(self, *lines):
+        FakeVision.boxes = [
+            {"text": t, "confidence": 1.0, "x": 0, "y": i, "w": 1, "h": 1}
+            for i, t in enumerate(lines)]
+        self.addCleanup(setattr, FakeVision, "boxes", [])
+
+    def test_launch_commits_when_spotlight_offers_to_open_the_app(self):
+        self.spotlight("Settings \u2014 Open", "Settings", "Apps", "Watch")
+        p = self.phone(LIVE)
+        self.assertEqual(p.send("apps.launch", name="Settings"), "Settings")
+        self.assertEqual(p.mirror.actions,
+                         ["press", "type", "capture", "press"])
+
+    def test_launch_refuses_a_top_hit_that_is_not_an_app(self):
+        # Notes is not installed: Return would hand the query to Siri.
+        self.spotlight("Notes - Ask Siri", "MONDAY", "Search")
+        p = self.phone(LIVE)
+        with self.assertRaises(RuntimeError) as cm:
+            p.send("apps.launch", name="Notes")
+        self.assertIn("Ask Siri", str(cm.exception))
+        # Spotlight is dismissed (Cmd+1) and Return is never pressed.
+        self.assertEqual(p.mirror.actions,
+                         ["press", "type", "capture", "press"])
+        self.assertEqual(p.mirror.combos[-1], "cmd+1")
+
+    def test_launch_ignores_dashed_lines_that_are_not_the_search_field(self):
+        self.assertIsNone(ios._top_hit(
+            [{"text": "Chase - balance alert", "y": 0}], "Settings"))
 
     def test_observer_notification_of_iphone_in_use_raises_before_the_action(self):
         holder = {}
