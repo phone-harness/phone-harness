@@ -359,8 +359,8 @@ def is_frontmost():
     reported iPhone Mirroring true while the frontmost window still belonged
     to the user's terminal — that used to read here as "no change, still
     focused". It is not: the background backend's SkyLight path
-    (_SLPSSetFrontProcessWithOptions in background._post/_make_key) makes
-    iPhone Mirroring the front *process* without raising its *window*, and
+    (the activate record in background._activate) makes
+    iPhone Mirroring AppKit-active without raising its *window*, and
     once that happens AXFrontmost reports true indefinitely even while the
     terminal's window stays on top and keeps receiving keyboard and scroll
     events — those are routed by window z-order, not by AX. So a steal that
@@ -448,8 +448,8 @@ def activate(timeout=2.5):
     #
     # activateWithOptions_ alone is not enough any more, now that is_frontmost
     # checks z-order too. Measured directly: once background.py's SkyLight
-    # calls (_SLPSSetFrontProcessWithOptions, used by every background tap and
-    # keystroke to target events at the process without raising its window)
+    # activate records (sent by every background keystroke so the app takes
+    # keys without becoming the front process or raising its window)
     # have left AXFrontmost true for this app, activateWithOptions_ becomes a
     # no-op — Cocoa sees an app that already reports itself frontmost and
     # skips the raise, so the window never moves and the loop above would spin
