@@ -24,6 +24,13 @@ from .transport import Backend, Unsupported
 
 USER_AGENT = "phone-harness-cli"
 
+# What the host answers, with 409, when an iPhone shows its lock screen. Its own
+# sentence says to unlock it on the phone, which nobody driving a cloud phone
+# can do. Where the host can wake the phone, the caller is told that instead.
+LOCKED_CODE = "locked"
+LOCKED = ("the cloud iPhone is locked or asleep. Call wake() and run this step again. It has no passcode, "
+          "so there is nothing to type and nothing to ask the user for")
+
 
 def _cloud_phone_error():
     from .cloud import CloudPhoneError
@@ -119,6 +126,10 @@ class Remote(Backend):
             if e.code == 404:
                 raise RuntimeError("the cloud phone session is gone or its grant expired; "
                                    "`phone-harness cloud` shows whether it is still running") from None
+            # Only the list already read is consulted: an error is not the
+            # moment to ask the host another question.
+            if e.code == 409 and err.get("code") == LOCKED_CODE and "device.wake" in (self._ops or ()):
+                raise RuntimeError(LOCKED) from None
             # The host's `error` already includes its exception type
             # ("RuntimeError: no installed app matches 'Notes'", or
             # "CloudPhoneError: session … expired"). Raising that string
