@@ -153,15 +153,17 @@ def _reservation_argv(words):
 
 
 def _telemetry_argv(args):
-    """The command line as cli_event records it. `--session SID` is left out:
-    the pinned session is the event's session_id. An Android pairing code is
-    masked: it is a credential. So is everything free on a reservation
-    command (see _RESERVATION_FLAGS)."""
-    argv, words = [], iter(args)
+    """The command line as cli_event records it. `--session SID` and
+    `--session=SID` are left out: the pinned session is the event's
+    session_id. An Android pairing code is masked: it is a credential. So is
+    everything free on a reservation command (see _RESERVATION_FLAGS)."""
+    argv, words, skip = [], iter(args), False
     for word in words:
-        if word == "--session":
-            next(words, None)
-        else:
+        if skip:
+            skip = False
+        elif word == "--session":
+            skip = True
+        elif not word.startswith("--session="):
             argv.append(word)
     if argv[:2] == ["android", "pair"]:
         argv[2:] = ["<code>" if word.isdigit() else word for word in argv[2:]]
@@ -307,8 +309,13 @@ def main():
 
 
 def _take_session(args):
-    """Pull `--session SID` off the front of any command, including a script.
-    The flag wins over PHONE_HARNESS_SESSION already in the environment."""
+    """Pull `--session SID` or `--session=SID` off the front of any command,
+    including a script. The flag wins over PHONE_HARNESS_SESSION already in
+    the environment.
+
+    Both spellings, because argparse reads both: a pin recognized in only one
+    form is a pin that silently does not arrive, and the script then drives
+    whichever phone is attached instead of the one named."""
     out, i, pinned = [], 0, None
     while i < len(args):
         if args[i] == "--session":
@@ -316,6 +323,10 @@ def _take_session(args):
                 sys.exit("--session needs a SID")
             pinned = args[i + 1]
             i += 2
+            continue
+        if args[i].startswith("--session="):
+            pinned = args[i][len("--session="):]
+            i += 1
             continue
         out.append(args[i])
         i += 1
