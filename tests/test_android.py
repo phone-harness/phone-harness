@@ -257,5 +257,107 @@ class ResolvePrimary(unittest.TestCase):
         self.assertNotIn("no-adb", str(cm.exception))
 
 
+
+DUMPSYS_NOTIF_SAMPLE = """
+Notification Record List:
+  NotificationRecord(0x7f8a123: pkg=com.google.android.apps.messaging user=UserHandle{0} id=101 tag=null: Notification(channel=sms pri=0))
+    uid=10123 userId=0 pkg=com.google.android.apps.messaging
+    key=0|com.google.android.apps.messaging|101|null|10123
+    postTime=1732000000000
+    flags=0x10
+    extras={
+      android.title=String (Google)
+      android.text=String (Your verification code is 482910. Valid for 10 minutes.)
+      android.subText=null
+      android.template=String (android.app.Notification$BigTextStyle)
+    }
+
+  NotificationRecord(0x7f8a456: pkg=com.whatsapp user=UserHandle{0} id=202 tag=null: Notification(channel=messages pri=1))
+    uid=10155 userId=0 pkg=com.whatsapp
+    key=0|com.whatsapp|202|null|10155
+    postTime=1732000005000
+    extras={
+      android.title=String (Alice)
+      android.text=String (Hey, are you free tonight?)
+    }
+
+  NotificationRecord(0x7f8a789: pkg=com.android.systemui user=UserHandle{0} id=303 tag=null: Notification(channel=status pri=-1))
+    uid=1000 userId=0 pkg=com.android.systemui
+    key=0|com.android.systemui|303|null|1000
+    postTime=1731999900000
+    extras={
+      android.title=String (USB debugging connected)
+      android.text=String (Tap to turn off USB debugging)
+    }
+"""
+
+
+class AndroidNotificationTests(unittest.TestCase):
+    def test_parse_notifications_extracts_records(self):
+        records = android_mod._parse_notifications(DUMPSYS_NOTIF_SAMPLE)
+        self.assertEqual(len(records), 3)
+
+        sms = records[0]
+        self.assertEqual(sms["package"], "com.google.android.apps.messaging")
+        self.assertEqual(sms["title"], "Google")
+        self.assertEqual(sms["text"], "Your verification code is 482910. Valid for 10 minutes.")
+        self.assertEqual(sms["time"], 1732000000000)
+        self.assertEqual(sms["key"], "0|com.google.android.apps.messaging|101|null|10123")
+
+        whatsapp = records[1]
+        self.assertEqual(whatsapp["package"], "com.whatsapp")
+        self.assertEqual(whatsapp["title"], "Alice")
+        self.assertEqual(whatsapp["text"], "Hey, are you free tonight?")
+
+    def test_parse_notifications_multiline_bigtext(self):
+        dump = """
+  NotificationRecord(0x111: pkg=com.bank user=UserHandle{0} id=1 tag=null: Notification())
+    uid=101 key=0|com.bank|1|null|101 postTime=123456
+    extras={
+      android.title=String (Bank Alert)
+      android.text=String (Code: 123)
+      android.bigText=String (Line 1: Your login OTP is 987654.\nLine 2: Expires soon.)
+    }
+"""
+        records = android_mod._parse_notifications(dump)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["title"], "Bank Alert")
+        self.assertEqual(records[0]["text"], "Line 1: Your login OTP is 987654.\nLine 2: Expires soon.")
+
+    def test_notification_list_op(self):
+        phone = android_mod.Android(serial="fake-device")
+        with unittest.mock.patch.object(phone, "_gate"), \
+             unittest.mock.patch.object(phone, "_sh", return_value=DUMPSYS_NOTIF_SAMPLE):
+            all_records = phone.send("notification.list")
+            self.assertEqual(len(all_records), 3)
+            self.assertEqual(all_records[0]["package"], "com.google.android.apps.messaging")
+
+            limited = phone.send("notification.list", limit=1)
+            self.assertEqual(len(limited), 1)
+            self.assertEqual(limited[0]["package"], "com.google.android.apps.messaging")
+
+    def test_wait_for_notification_extracts_otp(self):
+        from phone_harness import helpers
+        phone = android_mod.Android(serial="fake-device")
+        with unittest.mock.patch.object(helpers, "phone", phone), \
+             unittest.mock.patch.object(helpers, "send", lambda op, **kw: phone.send(op, **kw)), \
+             unittest.mock.patch.object(phone, "_gate"), \
+             unittest.mock.patch.object(phone, "_sh", return_value=DUMPSYS_NOTIF_SAMPLE):
+            # Test extracting 6-digit OTP code using regex capture group
+            otp = helpers.wait_for_notification(r"\b(\d{6})\b", timeout=1.0)
+            self.assertEqual(otp, "482910")
+
+            # Test matching whole notification dict
+            notif = helpers.wait_for_notification("Alice", timeout=1.0)
+            self.assertIsInstance(notif, dict)
+            self.assertEqual(notif["title"], "Alice")
+
+    def test_wait_for_notification_timeout(self):
+        from phone_harness import helpers
+        with unittest.mock.patch.object(helpers, "notifications", return_value=[]):
+            with self.assertRaises(TimeoutError):
+                helpers.wait_for_notification("Nonexistent", timeout=0.1, interval=0.05)
+
+
 if __name__ == "__main__":
     unittest.main()
