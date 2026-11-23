@@ -4,6 +4,7 @@ transport is faked and the clock does not tick.
 
     python -m unittest tests.test_ios_session
 """
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -71,6 +72,30 @@ TOUCH_ID = [("AXStaticText", "Passwords"),
             ("AXButton", "Home Screen"), ("AXButton", "App Switcher"),
             ("AXButton", "Cancel")]
 LIVE = []
+
+# The same screens on a Korean Mac, as iPhone Mirroring draws them. Matching
+# the English words alone read KO_CONNECTING as a finished failure.
+KO_CONNECTING = [("AXStaticText", "iPhone 16 Pro"),
+                 ("AXStaticText", "iPhone 16 Pro 다음에 연결 중")]
+KO_CONNECTING_BG = KO_CONNECTING + [("AXButton", "배경")]
+KO_IN_USE = [("AXStaticText", "iPhone 사용 중"),
+             ("AXStaticText", "연결하려면 iPhone을 잠그십시오.\n\niPhone이 더 "
+                              "이상 사용되지 않을 때 iPhone 미러링이 연결됩니다."),
+             ("AXButton", "다시 시도")]
+KO_CONNECT = [("AXStaticText", "시간 초과"), ("AXButton", "연결")]
+
+# A cut of the app's Localizable.loctable: the keys these tests touch, in
+# English and Korean. Written to a temp file so the tests read the same
+# table on any machine, with or without iPhone Mirroring installed.
+STRINGS = {
+    "en": {"Connecting to": "Connecting to", "Background": "Background",
+           "Connect": "Connect", "Try Again": "Try Again",
+           "Cancel": "Cancel", "iPhone in Use": "iPhone in Use",
+           "Timed Out": "Timed Out"},
+    "ko": {"Connecting to": "다음에 연결 중", "Background": "배경",
+           "Connect": "연결", "Try Again": "다시 시도", "Cancel": "취소",
+           "iPhone in Use": "iPhone 사용 중", "Timed Out": "시간 초과"},
+}
 
 
 class FakeMirror:
@@ -165,9 +190,19 @@ class FakeMirror:
 
 
 class FakeVision:
+    # Each thumbnail() pops the next; the last one repeats. One value means
+    # a picture that is already still.
+    thumbnails = [[0, 0, 0, 0]]
+
     @staticmethod
     def recognize(path, win):
         return []
+
+    @classmethod
+    def thumbnail(cls, path):
+        if len(cls.thumbnails) > 1:
+            return cls.thumbnails.pop(0)
+        return cls.thumbnails[0]
 
 
 @unittest.skipIf(ios is None, "pyobjc not installed")
@@ -176,15 +211,30 @@ class SessionRequire(unittest.TestCase):
         self._sleep, self._now, self._vision = ios._sleep, ios._now, ios._vision
         self._open, self._slice = ios._ax_watch_open, ios._run_loop_slice
         self._drain = ios._drain_run_loop
+        self._show_window_fn = ios._show_window
+        ios._show_window = lambda: False
         self.clock = [0.0]
         ios._sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)
         ios._now = lambda: self.clock[0]
         ios._vision = FakeVision
+        FakeVision.thumbnails = [[0, 0, 0, 0]]
+        import plistlib
+        import tempfile
+        fd, self._strings = tempfile.mkstemp(suffix=".loctable")
+        with os.fdopen(fd, "wb") as f:
+            plistlib.dump(STRINGS, f, fmt=plistlib.FMT_BINARY)
+        self._strings_path = ios._MIRROR_STRINGS
+        ios._MIRROR_STRINGS = self._strings
+        ios._reset_strings()
 
     def tearDown(self):
         ios._sleep, ios._now, ios._vision = self._sleep, self._now, self._vision
+        ios._MIRROR_STRINGS = self._strings_path
+        ios._reset_strings()
+        os.unlink(self._strings)
         ios._ax_watch_open, ios._run_loop_slice = self._open, self._slice
         ios._drain_run_loop = self._drain
+        ios._show_window = self._show_window_fn
 
     def watch_events(self, notify):
         """A fake observer. Each run-loop slice advances the fake clock and,
@@ -220,11 +270,19 @@ class SessionRequire(unittest.TestCase):
         return p
 
     def test_ready_does_nothing(self):
+        ios._show_window = lambda: True
         p = self.phone(LIVE)
         self.assertEqual(p._session_require(), WIN)
         self.assertEqual(p.mirror.launched, 0)
         self.assertEqual(p.mirror.pressed, [])
         self.assertEqual(p.mirror.shown, 1, "the window is shown once")
+
+    def test_the_window_is_not_raised_by_default(self):
+        # ios.show_window is off: connecting must not take the user's
+        # screen for a task that runs behind their work.
+        p = self.phone(LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        self.assertEqual(getattr(p.mirror, "shown", 0), 0)
 
     def test_launches_then_presses_connect_then_ready(self):
         p = self.phone(None, None, "no-window", CONNECT, CONNECT,
@@ -265,6 +323,7 @@ class SessionRequire(unittest.TestCase):
     def test_in_use_fails_fast_and_shows_the_window_first(self):
         # The app says "iPhone in Use" ~2s after the press and retries by
         # itself; waiting out the cap would only delay the user's lock.
+        ios._show_window = lambda: True
         p = self.phone(CONNECT, CONNECT, CONNECTING, CONNECTING,
                        IN_USE_RETRYING)
         with self.assertRaises(RuntimeError) as cm:
@@ -323,6 +382,77 @@ class SessionRequire(unittest.TestCase):
         self.assertEqual(p.mirror.pressed, [])
         self.assertGreater(self.clock[0], ios._ATTEMPT_SETTLE)
         self.assertLess(self.clock[0], ios._CONNECT_WAIT)
+
+    def test_launch_one_empty_read_is_not_a_connection(self):
+        # Cold start. The first look after launch read 'ready' (no
+        # accessibility content) and was returned on the spot; the stream
+        # was not up and the task's first screen() came back empty. It is
+        # held to three looks, like a press.
+        p = self.phone(None, None, LIVE, *([CONNECTING_PLAIN] * 6), LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        self.assertEqual(p.mirror.frames, [LIVE],
+                         "waited through Connecting to the live stream")
+        self.assertEqual(p.mirror.pressed, [])
+
+    def test_korean_connecting_after_launch_is_waited_for(self):
+        # Measured on a Korean Mac: "iPhone 16 Pro 다음에 연결 중" with no
+        # button. It raised "clear this on the Mac" while still connecting.
+        p = self.phone(None, None, *([KO_CONNECTING] * 8), LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        self.assertEqual(p.mirror.pressed, [])
+        self.assertGreater(self.clock[0], ios._ATTEMPT_SETTLE)
+        self.assertLess(self.clock[0], ios._CONNECT_WAIT)
+
+    def test_korean_background_button_is_not_pressed(self):
+        # The lone button on the Connecting screen is Background ("배경").
+        # A lone button that is not on the do-not-press list gets pressed,
+        # and that list was English only.
+        p = self.phone(KO_CONNECTING_BG)
+        with self.assertRaises(RuntimeError):
+            p._session_require()
+        self.assertEqual(p.mirror.pressed, [])
+        self.assertGreaterEqual(self.clock[0], ios._CONNECT_WAIT,
+                                "a Connecting screen is waited out to the cap")
+
+    def test_korean_connect_is_pressed_among_several_buttons(self):
+        p = self.phone(KO_CONNECT + [("AXButton", "취소")],
+                       KO_CONNECT + [("AXButton", "취소")],
+                       *([KO_CONNECTING] * 4), LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        self.assertEqual(p.mirror.pressed, ["연결"])
+
+    def test_korean_in_use_asks_the_user_to_lock_the_phone(self):
+        p = self.phone(KO_IN_USE, KO_IN_USE, *([KO_CONNECTING] * 2),
+                       KO_IN_USE)
+        with self.assertRaises(RuntimeError) as cm:
+            p._session_require()
+        msg = str(cm.exception)
+        self.assertIn("iPhone 사용 중", msg)
+        self.assertIn("LOCK your iPhone", msg)
+        self.assertEqual(p.mirror.pressed, ["다시 시도"])
+
+    def test_after_connect_waits_for_the_picture_to_settle(self):
+        # The stream fades in from a blur for ~0.7s after it reads live.
+        FakeVision.thumbnails = [[0, 0, 0, 0], [40, 40, 40, 40],
+                                 [90, 90, 90, 90], [91, 90, 90, 90]]
+        p = self.phone(None, None, *([CONNECTING_PLAIN] * 4), LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        self.assertEqual(p.mirror.actions.count("capture"), 4)
+        self.assertEqual(FakeVision.thumbnails, [[91, 90, 90, 90]])
+
+    def test_a_picture_that_never_settles_does_not_fail_the_session(self):
+        # A video keeps changing. That is a live phone, not a failure.
+        FakeVision.thumbnails = [[i * 10] * 4 for i in range(200)]
+        p = self.phone(None, None, *([CONNECTING_PLAIN] * 4), LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        captures = p.mirror.actions.count("capture")
+        self.assertGreater(captures, 2)
+        self.assertLessEqual(captures, ios._PAINT_WAIT / ios._PAINT_POLL + 2)
+
+    def test_an_already_live_session_takes_no_capture(self):
+        p = self.phone(LIVE)
+        self.assertEqual(p._session_require(), WIN)
+        self.assertNotIn("capture", p.mirror.actions)
 
     def test_login_prompt_is_never_pressed(self):
         p = self.phone(LOGIN)
@@ -414,6 +544,22 @@ class SessionRequire(unittest.TestCase):
         self.assertIn("iPhone in Use", str(cm.exception))
         self.assertEqual(p.mirror.actions, ["scroll"])
         self.assertEqual(p.mirror.pressed, [])
+
+    def test_a_window_that_blinks_out_after_a_scroll_is_not_a_lost_phone(self):
+        # Measured: right after a scroll the window read 'no-window', then
+        # 'not-running', for a fraction of a second, with the app up the
+        # whole time. Raising there stopped a long list walk for nothing.
+        p = self.phone(LIVE, LIVE, "no-window", None, LIVE)
+        p.send("input.scroll", x=1, y=1, dy=-10, dx=0)
+        self.assertEqual(p.mirror.actions, ["scroll"])
+        self.assertLess(self.clock[0], ios._GONE_RECHECK)
+
+    def test_a_window_that_stays_gone_still_raises(self):
+        p = self.phone(LIVE, LIVE, "no-window")
+        with self.assertRaises(RuntimeError) as cm:
+            p.send("input.scroll", x=1, y=1, dy=-10, dx=0)
+        self.assertIn("no phone window", str(cm.exception))
+        self.assertGreaterEqual(self.clock[0], ios._GONE_RECHECK)
 
     def test_live_actions_are_not_interrupted(self):
         p = self.phone(LIVE)

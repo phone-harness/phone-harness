@@ -21,8 +21,10 @@ What iPhone Mirroring cannot do appears here as absence rather than emulation:
 Each raises Unsupported, so a caller can ask rather than discover it by
 getting a plausible wrong answer.
 """
+import functools
 import importlib
 import os
+import plistlib
 
 from . import ocr as _vision
 from .transport import Backend
@@ -192,7 +194,7 @@ class IPhone(Backend):
         the user can watch the task. One press per call: a caller that retries after the user says
         the phone is locked gets a fresh press.
         """
-        state = self._session_state()
+        state = entry = self._session_state()
         if state == "not-running":
             self.mirror.launch()
             state = self._wait_state(("blocked", "ready"), _LAUNCH_WAIT)
@@ -201,6 +203,11 @@ class IPhone(Backend):
         self._show()
         if state == "no-window":
             state = self._wait_state(("blocked", "ready"), _WINDOW_WAIT)
+        if state == "ready" and entry != "ready":
+            # One empty read of a window that has just come up is not a
+            # live stream: the blank before "Connecting to" draws reads the
+            # same. Hold it to the same three looks a press is held to.
+            state = self._wait_connected(_CONNECT_WAIT)
         pressed = None
         if state == "blocked":
             pressed = self._press_connect()
@@ -211,8 +218,41 @@ class IPhone(Backend):
             if pressed or not self._finished_interstitial():
                 state = self._wait_connected(_CONNECT_WAIT)
         if state == "ready":
+            if entry != "ready":
+                self._wait_painted()
             return self.mirror.find_window()
         self._raise_not_live(state, pressed)
+
+    def _wait_painted(self, timeout=None):
+        """After a connect, wait for the stream's picture to settle.
+
+        Measured on a cold launch: the window reads 'ready' (no
+        accessibility content) while the phone's screen is still fading in
+        from a blur, for about 0.7 seconds. OCR in that gap returns nothing,
+        so the first screen() of a task saw an empty phone. A settled
+        picture is two captures in a row that barely differ.
+
+        Best effort and bounded: a phone playing video never settles, and
+        that is not a reason to fail the session, so this returns at the
+        cap without raising. Only runs after this call connected; an
+        already-live session returns at once."""
+        timeout = _PAINT_WAIT if timeout is None else timeout
+        start = _now()
+        prev = None
+        while True:
+            try:
+                path, _win = self.mirror.capture()
+                sig = _vision.thumbnail(path)
+            except Exception:
+                return
+            if sig is None:
+                return
+            if prev is not None and _frame_delta(prev, sig) <= _PAINT_STILL:
+                return
+            prev = sig
+            if _now() - start >= timeout:
+                return
+            _sleep(_PAINT_POLL)
 
     def _raise_if_not_live(self):
         """Raise the session-require error if the stream is no longer live.
@@ -222,6 +262,15 @@ class IPhone(Backend):
         change already queued is applied first; a missed notification still
         loses to one structural read (no capture, no OCR)."""
         state = self._live_probe()
+        # 'no-window' and 'not-running' have both been read for a fraction
+        # of a second around a scroll, with the app running the whole time
+        # (same pid, no crash report) and 'ready' a moment later. Neither is
+        # a screen the user has to clear, so look again before believing it.
+        # An interstitial ('blocked') is believed at once.
+        deadline = _now() + _GONE_RECHECK
+        while state in ("no-window", "not-running") and _now() < deadline:
+            _sleep(0.2)
+            state = self._structural_state()
         if state != "ready":
             self._raise_not_live(state)
 
@@ -313,9 +362,14 @@ class IPhone(Backend):
             "Call screenshot() to see what the window shows.")
 
     def _show(self):
-        """Bring the mirroring window to the front so the user can watch.
+        """Bring the mirroring window to the front so the user can watch,
+        when `ios.show_window` is on. Off by default: the background build
+        needs no focus, and raising the window on every connect took the
+        user's screen for a task meant to run behind their work.
         Best effort: a window that will not come forward is not a reason to
         fail the session, since the background build drives it regardless."""
+        if self.background and not _show_window():
+            return
         try:
             self.mirror.show()
         except Exception:
@@ -334,9 +388,10 @@ class IPhone(Backend):
                for role, _ in content):
             return None
         buttons = [t for role, t in content if role == "AXButton"]
-        if len(buttons) == 1 and buttons[0].lower() not in _NOT_CONNECT_BUTTONS:
+        if (len(buttons) == 1
+                and _normal(buttons[0]) not in _not_connect_buttons()):
             return self.mirror.press_window_button()
-        return self.mirror.press_window_button(_CONNECT_BUTTONS)
+        return self.mirror.press_window_button(_connect_buttons())
 
     def _wait_state(self, wanted, timeout):
         """Poll until the session is in one of `wanted` or time runs out;
@@ -484,11 +539,12 @@ class IPhone(Backend):
         The words are the signal. A Background button is the other form of
         the same screen; either one means the press has not finished."""
         content = self.mirror.window_ax_content()
-        text = " ".join(t for _role, t in content if t).lower()
-        if "connecting to" in text:
+        text = _normal(" ".join(t for _role, t in content if t))
+        if any(p in text for p in _phrases("Connecting to")):
             return True
-        return any(t.lower() == "background"
-                   for t, _el in self.mirror.window_ax_buttons())
+        background = _phrases("Background")
+        return any(_normal(t) in background
+                   for t, _el in self.mirror.window_ax_buttons() if t)
 
     def _session_refocus(self):
         self.mirror.activate()
@@ -509,8 +565,8 @@ def _blocked_guidance(said):
     to lock the iPhone. A Mac Touch ID or password sheet is the user's to
     approve or cancel. Anything else is cleared on the Mac.
     """
-    low = said.lower()
-    if any(p in low for p in ("in use", "timed out", "lock your iphone")):
+    low = _normal(said)
+    if any(p in low for p in _lock_phrases()):
         return ("This needs you: LOCK your iPhone, then tell me and I will "
                 "try once more. I never type a passcode.")
     if "touch id" in low or _has_word(low, "password"):
@@ -534,12 +590,114 @@ _CONNECT_BUTTONS = ("connect", "try again", "retry", "continue", "reconnect")
 # Connecting screen sends the app behind, "Cancel" gives up.
 _NOT_CONNECT_BUTTONS = ("background", "cancel", "quit", "unlock", "ok",
                         "done", "settings")
+# English words in a quoted interstitial that mean "lock the iPhone".
+_LOCK_WORDS = ("in use", "timed out", "lock your iphone")
+
+# --- the window's words in every language ------------------------------
+#
+# Everything above is matched against the window's own words, and the app
+# draws them in the Mac's language: on a Korean Mac "Connecting to" is
+# "다음에 연결 중" and Background is "배경". Matching English alone read the
+# Korean Connecting screen as a finished failure and raised while the phone
+# was still connecting. The app ships its strings for every language in one
+# table, so read the translations from there rather than keeping a list.
+
+_MIRROR_STRINGS = ("/System/Applications/iPhone Mirroring.app/Contents/"
+                   "Frameworks/ScreenContinuityUI.framework/Versions/A/"
+                   "Resources/Localizable.loctable")
+
+
+def _normal(text):
+    """Lower case with runs of whitespace as one space, the way
+    _session_detail quotes the window."""
+    return " ".join((text or "").split()).lower()
+
+
+@functools.lru_cache(maxsize=None)
+def _string_table():
+    """{English key: {normalised translation, ...}} across every language
+    the app ships. Empty when the table cannot be read: callers keep their
+    English words, which is what they had before."""
+    try:
+        with open(_MIRROR_STRINGS, "rb") as f:
+            table = plistlib.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for lang, strings in table.items():
+        if not isinstance(strings, dict) or lang.startswith("LocProvenance"):
+            continue
+        for key, value in strings.items():
+            if isinstance(value, str) and value.strip():
+                out.setdefault(key, set()).add(_normal(value))
+    return out
+
+
+def _phrases(*keys):
+    """The English keys and every translation of them, normalised."""
+    table = _string_table()
+    out = {_normal(k) for k in keys}
+    for k in keys:
+        out |= table.get(k, set())
+    out.discard("")
+    return frozenset(out)
+
+
+@functools.lru_cache(maxsize=None)
+def _connect_buttons():
+    return tuple(sorted(set(_CONNECT_BUTTONS)
+                        | _phrases("Connect", "Try Again", "Continue")))
+
+
+@functools.lru_cache(maxsize=None)
+def _not_connect_buttons():
+    return frozenset(set(_NOT_CONNECT_BUTTONS)
+                     | _phrases("Background", "Cancel", "Quit", "OK",
+                                "Settings"))
+
+
+@functools.lru_cache(maxsize=None)
+def _lock_phrases():
+    """Words that mean "lock the iPhone": the English ones, plus every
+    translation of each message whose English says so."""
+    keys = [k for k in _string_table()
+            if any(w in _normal(k) for w in _LOCK_WORDS)]
+    return frozenset(set(_LOCK_WORDS) | _phrases(*keys))
+
+
+def _reset_strings():
+    """Forget the cached string table, so the next match reads
+    _MIRROR_STRINGS again."""
+    for fn in (_string_table, _connect_buttons, _not_connect_buttons,
+               _lock_phrases):
+        fn.cache_clear()
 _LAUNCH_WAIT = 12.0     # app launch to phone window
 _WINDOW_WAIT = 6.0      # app running, window still coming up
 _CONNECT_WAIT = 12.0    # press to live stream, the cap; a hang emits no events
 _ATTEMPT_SETTLE = 2.5   # a press has drawn Connecting and then its outcome by now
 _EVENT_SLICE = 0.2      # how long one CFRunLoopRunInMode turn waits
 _EVENT_QUIET = 1.0      # re-check when no notification arrives for this long
+_GONE_RECHECK = 1.5     # how long a vanished window may take to come back
+_PAINT_WAIT = 3.0       # cap on waiting for the picture to settle after connect
+_PAINT_POLL = 0.2       # between the two captures compared
+_PAINT_STILL = 3.0      # mean luminance change (0-255) that counts as settled
+
+
+def _show_window():
+    """`ios.show_window`: raise the mirroring window on connect."""
+    try:
+        from . import config
+        return bool(config.get("ios.show_window"))
+    except Exception:
+        return False
+
+
+def _frame_delta(a, b):
+    """Mean absolute difference of two equal-length luminance thumbnails;
+    infinity when they cannot be compared."""
+    if not a or len(a) != len(b):
+        return float("inf")
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 # Posted on the app element and the phone window. A Connecting screen that
 # never exposes a button still changes one of these as its label appears and

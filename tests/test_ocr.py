@@ -23,6 +23,57 @@ class TestVisionOCRInitOptions(unittest.TestCase):
         self.assertNotIn("NSURL.fileURLWithPath_(path), {})", ocr_source)
 
 
+try:
+    from phone_harness import ocr as _ocr
+except ImportError:                      # no pyobjc
+    _ocr = None
+
+# What macOS 27's VNRecognizeTextRequest revision 3 lists as supported.
+SUPPORTED = ["en-US", "fr-FR", "it-IT", "de-DE", "es-ES", "pt-BR", "zh-Hans",
+             "zh-Hant", "yue-Hans", "yue-Hant", "ko-KR", "ja-JP", "ru-RU",
+             "uk-UA", "th-TH", "vi-VT", "ar-SA", "ars-SA"]
+
+
+@unittest.skipIf(_ocr is None, "pyobjc not installed")
+class TestRecognitionLanguages(unittest.TestCase):
+    """Vision reads English only unless told otherwise. On a Korean Mac the
+    Home Screen came back as its clock, and "KB국민은행" as "KBA028"."""
+
+    def pick(self, *preferred):
+        return _ocr.pick_languages(SUPPORTED, list(preferred))
+
+    def test_korean_mac_reads_korean_then_english(self):
+        self.assertEqual(self.pick("ko-KR"), ["ko-KR", "en-US"])
+
+    def test_english_in_another_region_is_english(self):
+        self.assertEqual(self.pick("en-KR"), ["en-US"])
+
+    def test_order_follows_the_mac(self):
+        self.assertEqual(self.pick("ja-JP", "ko-KR", "en-GB"),
+                         ["ja-JP", "ko-KR", "en-US"])
+
+    def test_chinese_matches_by_script(self):
+        self.assertEqual(self.pick("zh-Hant-TW"), ["zh-Hant", "en-US"])
+        self.assertEqual(self.pick("zh-Hans-CN"), ["zh-Hans", "en-US"])
+        # A bare "zh" names no script; guessing one would misread the other.
+        self.assertEqual(self.pick("zh"), ["en-US"])
+
+    def test_region_variants_fall_back_to_the_language(self):
+        self.assertEqual(self.pick("pt-PT", "fr-CA"),
+                         ["pt-BR", "fr-FR", "en-US"])
+
+    def test_unsupported_languages_leave_english(self):
+        self.assertEqual(self.pick("he-IL", "fi-FI"), ["en-US"])
+
+    def test_underscores_and_duplicates(self):
+        self.assertEqual(self.pick("ko_KR", "ko-KR", "en-US"),
+                         ["ko-KR", "en-US"])
+
+    def test_recognize_sets_the_languages(self):
+        source = (SRC / "phone_harness" / "ocr.py").read_text(encoding="utf-8")
+        self.assertIn("request.setRecognitionLanguages_(", source)
+
+
 @unittest.skipUnless(sys.platform == "darwin", "Real Vision OCR requires macOS")
 class TestRealVisionOCROnMacOS(unittest.TestCase):
     def test_real_vision_request_handler_init_with_none(self):

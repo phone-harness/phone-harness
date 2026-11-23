@@ -62,6 +62,7 @@ _appserv.GetProcessForPID.restype = ctypes.c_int
 _sky._SLPSSetFrontProcessWithOptions.argtypes = [
     ctypes.POINTER(_PSN), ctypes.c_uint32, ctypes.c_uint32]
 _sky.SLPSPostEventRecordTo.argtypes = [ctypes.POINTER(_PSN), ctypes.c_void_p]
+_sky._SLPSGetFrontProcess.argtypes = [ctypes.POINTER(_PSN)]
 
 _KCPS_USER_GENERATED = 0x200
 # CGSEventType values (share the CGEventType numbering)
@@ -192,34 +193,101 @@ def _ctx():
     return running_app().processIdentifier(), win
 
 
+# --- focus, borrowed for one gesture and given back ---
+#
+# The event records above only land while iPhone Mirroring is the front
+# process. _post makes it so, and nothing gave it back: after the first tap
+# every keystroke the user typed went to the phone. Measured with Ghostty in
+# front: the first tap only moved focus and never reached the phone (iOS saw
+# nothing); a second tap landed. A record posted without taking focus at all
+# did not land either.
+#
+# So take focus first, let it settle, run the gesture, and hand the front
+# process back to whatever had it. The window is never raised: the PSN is
+# restored with no window, so the user's window order does not change, and
+# the user loses keyboard focus for about a quarter of a second per gesture.
+
+_FOCUS_SETTLE = 0.15    # focus to first event; measured 0.1 enough
+_FOCUS_LINGER = 0.1     # last event to giving focus back; earlier drops it
+_borrow_depth = 0
+
+
+def _front_psn():
+    """The front process, or None when SkyLight will not say."""
+    psn = _PSN()
+    try:
+        err = _sky._SLPSGetFrontProcess(ctypes.byref(psn))
+    except Exception:
+        return None
+    if err or (psn.hi, psn.lo) == (0, 0):
+        return None
+    return psn
+
+
+@contextmanager
+def _borrowed_focus():
+    """(pid, win) with iPhone Mirroring the front process for the body.
+
+    Nested uses share the outer borrow, so type_text's paste, which presses
+    cmd+v through press(), takes focus once rather than per key."""
+    global _borrow_depth
+    pid, win = _ctx()
+    if _borrow_depth:
+        _borrow_depth += 1
+        try:
+            yield pid, win
+        finally:
+            _borrow_depth -= 1
+        return
+    mine = _PSN()
+    _appserv.GetProcessForPID(pid, ctypes.byref(mine))
+    prev = _front_psn()
+    # Unknown front process: behave as before (take focus, keep it) rather
+    # than guess where to hand it back.
+    borrowed = prev is not None and (prev.hi, prev.lo) != (mine.hi, mine.lo)
+    if borrowed:
+        _make_key(pid, win["id"])
+        time.sleep(_FOCUS_SETTLE)
+    _borrow_depth = 1
+    try:
+        yield pid, win
+    finally:
+        _borrow_depth = 0
+        if borrowed:
+            time.sleep(_FOCUS_LINGER)
+            _sky._SLPSSetFrontProcessWithOptions(
+                ctypes.byref(prev), 0, _KCPS_USER_GENERATED)
+
+
 def _emit(etype, gx, gy, pid, win):
     _post(pid, win["id"], etype, gx, gy, gx - win["x"], gy - win["y"])
 
 
 def tap(x, y):
-    pid, win = _ctx()
-    _emit(_LMOUSE_DOWN, x, y, pid, win)
-    time.sleep(0.05)
-    _emit(_LMOUSE_UP, x, y, pid, win)
+    with _borrowed_focus() as (pid, win):
+        _emit(_LMOUSE_DOWN, x, y, pid, win)
+        time.sleep(0.05)
+        _emit(_LMOUSE_UP, x, y, pid, win)
 
 
 def long_press(x, y, duration=0.8):
-    pid, win = _ctx()
-    _emit(_LMOUSE_DOWN, x, y, pid, win)
-    time.sleep(duration)
-    _emit(_LMOUSE_UP, x, y, pid, win)
+    with _borrowed_focus() as (pid, win):
+        _emit(_LMOUSE_DOWN, x, y, pid, win)
+        time.sleep(duration)
+        _emit(_LMOUSE_UP, x, y, pid, win)
 
 
 def drag(x1, y1, x2, y2, duration=0.35, steps=14):
     """Touch-drag (an iOS swipe), delivered with the window unfocused."""
-    pid, win = _ctx()
-    _emit(_LMOUSE_DOWN, x1, y1, pid, win)
-    time.sleep(0.02)
-    for i in range(1, steps + 1):
-        t = i / steps
-        _emit(_LMOUSE_DRAGGED, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, pid, win)
-        time.sleep(duration / steps)
-    _emit(_LMOUSE_UP, x2, y2, pid, win)
+    with _borrowed_focus() as (pid, win):
+        _emit(_LMOUSE_DOWN, x1, y1, pid, win)
+        time.sleep(0.02)
+        for i in range(1, steps + 1):
+            t = i / steps
+            _emit(_LMOUSE_DRAGGED, x1 + (x2 - x1) * t,
+                  y1 + (y2 - y1) * t, pid, win)
+            time.sleep(duration / steps)
+        _emit(_LMOUSE_UP, x2, y2, pid, win)
 
 
 def scroll_wheel(dy, x, y, steps=6, dx=0):
@@ -255,15 +323,22 @@ def scroll_wheel(dy, x, y, steps=6, dx=0):
     # pointer: with Chrome overlapping the mirroring window, the gesture was
     # delivered to Chrome and silently scrolled the user's browser instead of
     # the phone. Raise the window first, then give focus back.
+    #
+    # Only when something actually covers the point, though. With the phone
+    # window uncovered there, the warp alone delivers the scroll and the
+    # user's app keeps focus; raising it every time made each scroll a
+    # visible app switch.
     from AppKit import NSWorkspace
-    prev = NSWorkspace.sharedWorkspace().frontmostApplication()
-    try:
-        mirror.activate()
-    except RuntimeError:
-        pass                     # not frontmost-able; the warp below may still win
+    prev = None
+    if not mirror.window_owns_point(x, y):
+        prev = NSWorkspace.sharedWorkspace().frontmostApplication()
+        try:
+            mirror.activate()
+        except RuntimeError:
+            pass                 # not frontmost-able; the warp below may still win
 
-    # Refuse rather than scroll whatever the user just brought forward.
-    mirror.require_window_at(x, y)
+        # Refuse rather than scroll whatever the user just brought forward.
+        mirror.require_window_at(x, y)
 
     home = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
     Quartz.CGWarpMouseCursorPosition(Quartz.CGPointMake(x, y))
@@ -353,8 +428,8 @@ def _holding(pid, wid, mods):
 
 
 def press(combo):
-    """press('return'), press('cmd+1'), press('cmd+3') — no focus change."""
-    pid, win = _ctx()
+    """press('return'), press('cmd+1'), press('cmd+3') — focus borrowed and
+    given back."""
     parts = combo.lower().split("+")
     key, mods = parts[-1], parts[:-1]
     if key not in mirror._KEYCODES:
@@ -362,24 +437,27 @@ def press(combo):
     for m in mods:
         if m not in mirror._MOD_KEYCODES:
             raise ValueError(f"unknown modifier {m!r}")
-    with _holding(pid, win["id"], mods) as flags:
-        _key(pid, win["id"], mirror._KEYCODES[key], flags)
+    with _borrowed_focus() as (pid, win):
+        with _holding(pid, win["id"], mods) as flags:
+            _key(pid, win["id"], mirror._KEYCODES[key], flags)
 
 
 def _type_keystrokes(text, delay=0.03):
     """Type via real keycodes, no focus change. Subject to iOS autocorrect,
     which rewrites words as they are typed."""
-    pid, win = _ctx()
-    for i, line in enumerate(text.split("\n")):
-        if i:
-            _key(pid, win["id"], mirror._KEYCODES["return"])
-        for ch in line:
-            code, shifted = mirror._keycode_for(ch)
-            if code is None:
-                raise ValueError(f"cannot type {ch!r} via keycodes")
-            with _holding(pid, win["id"], ["shift"] if shifted else []) as flags:
-                _key(pid, win["id"], code, flags)
-            time.sleep(delay)
+    for ch in text:
+        if ch != "\n" and mirror._keycode_for(ch)[0] is None:
+            raise ValueError(f"cannot type {ch!r} via keycodes")
+    with _borrowed_focus() as (pid, win):
+        for i, line in enumerate(text.split("\n")):
+            if i:
+                _key(pid, win["id"], mirror._KEYCODES["return"])
+            for ch in line:
+                code, shifted = mirror._keycode_for(ch)
+                with _holding(pid, win["id"],
+                              ["shift"] if shifted else []) as flags:
+                    _key(pid, win["id"], code, flags)
+                time.sleep(delay)
 
 
 def type_text(text, delay=0.03, keystrokes=False):
@@ -390,4 +468,5 @@ def type_text(text, delay=0.03, keystrokes=False):
     """
     if keystrokes or not text:
         return _type_keystrokes(text, delay)
-    mirror.paste_with(press, text)
+    with _borrowed_focus():
+        mirror.paste_with(press, text)

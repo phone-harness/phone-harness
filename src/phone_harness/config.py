@@ -88,6 +88,7 @@ DEFAULTS = {
         "phone": "",           # what a bare `cloud start` names: a catalog id or label; empty = the service's unnamed start
     },
     "ios": {
+        "show_window": False,         # bring iPhone Mirroring to the front on connect
         "restore_clipboard": False,   # put the old clipboard back after a paste
         "paste_settle": 2.0,          # ...after this many seconds, if so
     },
