@@ -18,7 +18,7 @@ live inside one backend each, behind the ops documented in transport.py, so
 `nav.home` and `screen.text` mean the same thing everywhere even though an
 iPhone answers them with a Cmd+1 keystroke and Vision OCR.
 """
-import hashlib, importlib.util, time
+import hashlib, importlib.util, re, time
 from pathlib import Path
 
 from . import transport
@@ -616,6 +616,33 @@ def shell(cmd, binary=False, timeout=60):
     """Backend escape hatch. Unsupported on iOS, where the substrate is Quartz
     rather than a command channel — `import Quartz` in your own script."""
     return send("raw", cmd=cmd, binary=binary, timeout=timeout)
+
+
+def notifications(limit=None):
+    """Active notifications: [{package, title, text, time, key}]."""
+    return send("notification.list", limit=limit)
+
+
+def wait_for_notification(pattern=None, timeout=30.0, interval=1.0):
+    r"""Wait until a notification arrives whose title or text matches `pattern`.
+
+    `pattern` can be a regex string or compiled pattern (e.g. r'\b(\d{6})\b' for OTP).
+    Returns the matching capture group if parentheses were used in the pattern,
+    else the notification dict itself.
+    Raises TimeoutError if timeout expires without a match.
+    """
+    deadline = time.time() + timeout
+    regex = re.compile(pattern) if isinstance(pattern, str) else pattern
+    while time.time() < deadline:
+        for notif in notifications():
+            target = f"{notif.get('title', '')} {notif.get('text', '')}"
+            if regex is None:
+                return notif
+            m = regex.search(target)
+            if m:
+                return m.group(1) if m.groups() else notif
+        time.sleep(interval)
+    raise TimeoutError(f"no notification matching {pattern!r} arrived within {timeout}s")
 
 
 # --- timing -----------------------------------------------------------------

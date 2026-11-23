@@ -45,6 +45,7 @@ nothing in common — so the shared layer is this vocabulary instead.
     apps.launch  name -> app id
     apps.current      -> app id or None
     apps.list    include_system=False -> [app id]
+    notification.list limit=None      -> [{package, title, text, time, key}]
 
         Unsupported where the concept does not exist, rather than emulated.
         iPhone Mirroring has no system Back button and exposes no app
@@ -106,6 +107,7 @@ OP_NAMES = (
     "input.keys", "input.text",
     "nav.home", "nav.back", "nav.recents",
     "apps.launch", "apps.current", "apps.list",
+    "notification.list",
     "device.wake",
     "session.state", "session.require", "session.refocus", "session.detail",
     "focus.probe", "focus.diff",

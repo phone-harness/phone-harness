@@ -194,6 +194,55 @@ class PrimaryUnreachable(RuntimeError):
     """The saved primary phone is not reachable. Not a cue to use another."""
 
 
+def _parse_notifications(dump_text):
+    """Parse `dumpsys notification` output into [{package, title, text, time, key}]."""
+    if not dump_text:
+        return []
+    records = []
+    parts = re.split(r"\n\s*NotificationRecord\(", dump_text)
+    for part in parts[1:]:
+        pkg_m = re.search(r"pkg=([a-zA-Z0-9._]+)", part)
+        pkg = pkg_m.group(1) if pkg_m else ""
+
+        key_m = re.search(r"key=([^\s\n]+)", part)
+        key = key_m.group(1) if key_m else ""
+
+        time_m = re.search(r"postTime=(\d+)", part)
+        post_time = int(time_m.group(1)) if time_m else 0
+
+        title = ""
+        title_m = re.search(r"android\.title=String\s*\((.*?)\)(?=\n\s*(?:android\.|\}))", part, re.DOTALL)
+        if not title_m:
+            title_m = re.search(r"android\.title=([^\n,]+)", part)
+        if title_m:
+            title = title_m.group(1).strip()
+            if title == "null":
+                title = ""
+
+        text = ""
+        big_m = re.search(r"android\.bigText=String\s*\((.*?)\)(?=\n\s*(?:android\.|\}))", part, re.DOTALL)
+        if big_m and big_m.group(1).strip() and big_m.group(1).strip() != "null":
+            text = big_m.group(1).strip()
+        else:
+            text_m = re.search(r"android\.text=String\s*\((.*?)\)(?=\n\s*(?:android\.|\}))", part, re.DOTALL)
+            if not text_m:
+                text_m = re.search(r"android\.text=([^\n,]+)", part)
+            if text_m:
+                text = text_m.group(1).strip()
+                if text == "null":
+                    text = ""
+
+        if pkg or title or text:
+            records.append({
+                "package": pkg,
+                "title": title,
+                "text": text,
+                "time": post_time,
+                "key": key,
+            })
+    return records
+
+
 class Android(Backend):
     name = "android"
 
@@ -590,6 +639,21 @@ class Android(Backend):
         out = self._sh("pm list packages" + ("" if include_system else " -3"))
         return sorted(l[len("package:"):].strip()
                       for l in out.splitlines() if l.startswith("package:"))
+
+    # --- notifications ------------------------------------------------------
+
+    def _notification_list(self, limit=None):
+        """Active notifications: [{package, title, text, time, key}]."""
+        self._gate()
+        try:
+            out = self._sh("dumpsys notification --noredact", timeout=15)
+        except Exception:
+            try:
+                out = self._sh("dumpsys notification", timeout=15)
+            except Exception:
+                return []
+        records = _parse_notifications(out)
+        return records[:limit] if limit is not None else records
 
     # --- session ------------------------------------------------------------
 
