@@ -206,6 +206,22 @@ def scroll_wheel(dy, x, y, steps=6):
 # down/up pair with a blanked location) and then posting the key event to the
 # process by pid lands the text with no activation — verified by typing into
 # Spotlight while another app stayed frontmost.
+#
+# One cosmetic side effect: _make_key's focus record carries a location, so the
+# window server nudges the real cursor a few points each time, and it adds up
+# over a long type_text. The app never loses focus, but the user's pointer
+# visibly drifts. We snapshot the cursor before a keyboard op and warp it back
+# after (once per op, not per keystroke, so there's no stutter).
+
+def _cursor_pos():
+    return Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+
+
+def _restore_cursor(pos):
+    Quartz.CGWarpMouseCursorPosition(pos)
+    # re-associate so the physical mouse keeps controlling the warped cursor
+    Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+
 
 def _make_key(pid, wid):
     buf = (ctypes.c_uint8 * 0xf8)()
@@ -243,19 +259,27 @@ def press(combo):
     flags = 0
     for m in mods:
         flags |= mirror._MODIFIERS[m]
-    _key(pid, win["id"], mirror._KEYCODES[key], flags)
+    saved = _cursor_pos()
+    try:
+        _key(pid, win["id"], mirror._KEYCODES[key], flags)
+    finally:
+        _restore_cursor(saved)
 
 
 def type_text(text, delay=0.03):
     """Type into the focused iOS field via real keycodes, no focus change."""
     pid, win = _ctx()
-    for i, line in enumerate(text.split("\n")):
-        if i:
-            _key(pid, win["id"], mirror._KEYCODES["return"])
-        for ch in line:
-            code, shifted = mirror._keycode_for(ch)
-            if code is None:
-                raise ValueError(f"cannot type {ch!r} via keycodes")
-            _key(pid, win["id"], code,
-                 Quartz.kCGEventFlagMaskShift if shifted else 0)
-            time.sleep(delay)
+    saved = _cursor_pos()
+    try:
+        for i, line in enumerate(text.split("\n")):
+            if i:
+                _key(pid, win["id"], mirror._KEYCODES["return"])
+            for ch in line:
+                code, shifted = mirror._keycode_for(ch)
+                if code is None:
+                    raise ValueError(f"cannot type {ch!r} via keycodes")
+                _key(pid, win["id"], code,
+                     Quartz.kCGEventFlagMaskShift if shifted else 0)
+                time.sleep(delay)
+    finally:
+        _restore_cursor(saved)
