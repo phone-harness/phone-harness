@@ -69,6 +69,13 @@ The agent installs the CLI, asks which phone to use, and walks you through the s
 
 `phone-harness doctor` checks the setup. Full details: [install.md](install.md) and [setup/](setup/).
 
+If a cloud iPhone's taps or swipes are sent but do not land,
+`phone-harness --session SID input-reset` remakes its touch/HID channel.
+It takes no operation arguments and prints the complete host remake result as
+JSON. Exit status is 0 only for `ok: true`; `ok: false` exits 1 even with HTTP
+200. It does not dismiss alerts, erase the phone, restart the session, or
+wake/unlock it. The selected host must support `input.reset`.
+
 **MCP:** add `https://mcp.phone-harness.com/mcp` to any MCP client ([setup](https://github.com/phone-harness/mcp)). Cloud Android and iPhone only for now.
 
 **Hermes Agent:** `hermes plugins install phone-harness/phone-harness/integrations/hermes`. See [integrations/hermes](integrations/hermes/README.md).

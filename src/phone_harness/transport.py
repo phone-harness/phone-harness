@@ -23,6 +23,7 @@ nothing in common — so the shared layer is this vocabulary instead.
         explicit field — Vision returns confidence 1.0 for clean text just as a
         tree does, so confidence cannot tell them apart.
 
+    input.reset                         -> last_remake dict; check ok (cloud iPhone)
     input.tap           x, y
     input.press         x, y, duration              long press
     input.drag          x1, y1, x2, y2, duration, steps
@@ -102,7 +103,7 @@ class Unsupported(RuntimeError):
 OP_NAMES = (
     "screen.capture", "screen.bounds", "screen.require",
     "screen.text", "screen.text_pixels",
-    "input.tap", "input.press", "input.drag", "input.scroll",
+    "input.tap", "input.press", "input.drag", "input.scroll", "input.reset",
     "input.keys", "input.text",
     "nav.home", "nav.back", "nav.recents",
     "apps.launch", "apps.current", "apps.list",

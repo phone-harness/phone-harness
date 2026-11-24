@@ -328,6 +328,16 @@ the user. Check `supports('device.wake')` first; an older host lists no such
 op, and its refusal is `The iPhone is locked. Unlock it on the phone ...`.
 There, `home()` is the one thing to try.
 
+**Taps or swipes sent but not landing.** Run `phone-harness input-reset` (or
+`phone-harness --session SID input-reset`) to remake only the cloud iPhone's
+touch/HID channel. It takes no coordinates or hold arguments. It does not
+dismiss an alert, erase the device, restart the session, or wake/unlock the
+phone. The command prints the host's complete remake object as JSON and exits
+0 only for `ok: true`; `ok: false` exits 1 even when HTTP returned 200. Scripts
+can use `send('input.reset')` and must check the returned object's `ok` value.
+Check `supports('input.reset')` for older hosts; unsupported backends are not
+given a fallback gesture.
+
 The client posts `{"op", "kw"}` to `<control url>/op` and reads the host's
 list from `GET <control url>/ops` (`remote.py`). `supports(op)` is that list.
 `send` of an op the host did not list raises `Unsupported` before the POST
@@ -343,6 +353,7 @@ documents or decodes.
 | `screen.text` | `min_confidence` | `[{text, confidence, source, x, y, w, h}]`. `source` is `"pixels"` or `"tree"`. |
 | `screen.text_pixels` | `min_confidence` | same, forced through pixel OCR |
 | `input.tap` | `x, y` | host result, passed through |
+| `input.reset` | none | host `input_status.last_remake` object unchanged, including `ok: false`. Remakes touch/HID only; no wake/unlock gate. |
 | `input.press` | `x, y, duration` | host result. Long press. |
 | `input.drag` | `x1, y1, x2, y2, duration, steps` | host result |
 | `input.scroll` | `x, y, dy, dx, steps` | host result. Content-space deltas. |

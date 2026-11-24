@@ -161,6 +161,10 @@ class Remote(Backend):
         is asked nothing, so its own sentence stands.
         """
         ops = self._ops or ()
+        # Repairing the HID channel does not depend on the lock screen. Do
+        # not probe session.state or turn a reset failure into wake advice.
+        if op == "input.reset":
+            return False
         if getattr(error, "status", None) != 409 or "device.wake" not in ops:
             return False
         if getattr(error, "code", None) == LOCKED_CODE:
@@ -197,6 +201,10 @@ class Remote(Backend):
         return self._op(op, **kw)
 
     # --- the ops whose shape is local -----------------------------------------
+
+    def _input_reset(self):
+        """Force a touch/HID remake; preserve the host's result, even ok=false."""
+        return self._op("input.reset")
 
     def _screen_capture(self, path=None):
         r = self._op("screen.capture", timeout=60)

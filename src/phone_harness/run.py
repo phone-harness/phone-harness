@@ -2,6 +2,7 @@
 import argparse
 import functools
 import io
+import json
 import os
 import sys
 import time
@@ -22,6 +23,7 @@ Commands:
   phone-harness --doctor [ios|android]   diagnose the phone the helpers would drive
   phone-harness doctor [ios|android]     same diagnosis as --doctor
   phone-harness skill       print the phone-harness skill text
+  phone-harness input-reset remake a cloud iPhone's touch/HID channel; print its result
   phone-harness android ... pair/connect/choose an Android phone
   phone-harness cloud ...   start a catalog phone: `cloud login`, `cloud ls`, `cloud start [PHONE]`
   phone-harness config ...  settings: `config set platform android`
@@ -180,7 +182,7 @@ def _telemetry_command(args):
         return "version"
     if first in {"--doctor", "doctor"}:
         return "doctor"
-    if first in {"android", "cloud", "config", "skill", "update"}:
+    if first in {"android", "cloud", "config", "skill", "update", "input-reset"}:
         return first
     return "usage"
 
@@ -351,7 +353,7 @@ def _build_parser():
                         help=argparse.SUPPRESS)
     sub = parser.add_subparsers(
         dest="command", required=False,
-        metavar="{doctor,skill,config,update,cloud,android}",
+        metavar="{doctor,skill,input-reset,config,update,cloud,android}",
     )
 
     doctor = sub.add_parser(
@@ -369,6 +371,16 @@ def _build_parser():
         description="Print the phone-harness skill text.",
     )
     skill.add_argument("words", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
+    sub.add_parser(
+        "input-reset",
+        help="remake a cloud iPhone's touch/HID channel",
+        description=("Use when taps or swipes are sent but do not land. Remakes only the touch/HID "
+                     "channel; does not dismiss an alert, erase the device, restart the session, "
+                     "or wake/unlock the phone. Takes no arguments. Prints the host's remake "
+                     "result as JSON; exits 0 only when ok is true, otherwise non-zero. "
+                     "Use --session SID to select a cloud phone."),
+    )
 
     sub.add_parser(
         "config",
@@ -499,6 +511,12 @@ def _run(args):
     if ns.command == "update":
         from .update import cmd_update
         sys.exit(cmd_update([]))
+    if ns.command == "input-reset":
+        from .transport import connect
+        result = connect().send("input.reset")
+        print(json.dumps(result))
+        # An HTTP 200 only means the host answered, not that it recovered.
+        sys.exit(0 if isinstance(result, dict) and result.get("ok") is True else 1)
     if ns.command in _OWNED:
         _dispatch_owned(ns.command, list(ns.rest))
         return
