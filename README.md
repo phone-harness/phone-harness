@@ -23,6 +23,8 @@
 
 ---
 
+English | [Tiếng Việt](README.vi.md)
+
 Enable Claude Code, Codex, or any agent to use your real phone. The agent can
 scroll, tap, type, and read your phone with no jailbreak, no Xcode, and nothing
 installed on the phone.
