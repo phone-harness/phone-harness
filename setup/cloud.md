@@ -47,6 +47,31 @@ can stay running.
 A cloud iPhone is a separate phone from the user's own, with its own apps
 and logins; if an app asks for an Apple ID or any sign-in, ask the user.
 
+## Organizations
+
+Every account is an organization of one. An owner can invite teammates, who
+then share that organization's phones. A command acts in one organization:
+the user's own, unless another is chosen.
+
+```bash
+phone-harness cloud orgs                 # the account's organizations (* = the one in use), and invitations
+phone-harness cloud orgs accept INVITE   # join the organization an invitation is for
+phone-harness cloud orgs use ORG         # act in it from this install: its id, name, or owner's email
+phone-harness cloud orgs use personal    # go back to the user's own
+```
+
+- `cloud orgs use` is saved for this install's `cloud login` sign-in
+  (`cloud.org` in the config file). `PHONE_HARNESS_ORG`, set to an id from
+  `cloud orgs`, names the organization for one process and wins over it.
+- An API key belongs to one organization and always acts in it: it needs no
+  `PHONE_HARNESS_ORG`, and `cloud orgs use` does not apply to it.
+- An invitation is for the address it was sent to. That person accepts it
+  signed in with `cloud login`; an API key cannot.
+- `cloud whoami` names the organization when it is not the user's own, and
+  `cloud keys` says who made each key.
+
+Accept an invitation, or switch organization, only when the user asks.
+
 ## Reserve a phone
 
 An account with no cloud iPhone yet, or one that needs more of them, reserves

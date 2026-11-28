@@ -4,7 +4,11 @@ For agents that can make HTTPS requests but cannot install the CLI.
 Full reference: https://phone-harness.com/docs
 
 All calls send `Authorization: Bearer $PHONE_HARNESS_API_KEY` (see
-[cloud.md](cloud.md) for getting a key).
+[cloud.md](cloud.md) for getting a key). An API key belongs to one
+organization and acts in it, so a call made with one needs nothing more. A
+call made with a sign-in instead acts in the caller's own organization unless
+it names another in an `X-Phone-Harness-Org: org_...` header; `GET /orgs`
+lists the ones the caller is in.
 
 ```bash
 API=https://api.phone-harness.com

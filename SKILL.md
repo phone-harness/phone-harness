@@ -447,6 +447,46 @@ phone-harness cloud reservations cancel ID     # says what it would refund; --ye
   and cancel: reserve when the user means it.
 - `--json` on any of these prints the API's own answer.
 
+## Organizations
+
+Every cloud account is an organization of one. An owner can invite teammates,
+who then share that organization's phones. A command acts in exactly one
+organization: the user's own, unless another is chosen. The phones the
+`cloud` commands list and start are then that organization's.
+
+```bash
+phone-harness cloud orgs                   # the account's organizations (* = the one in use), and invitations
+phone-harness cloud orgs use ORG           # act in it from this install: its id, name, or owner's email
+phone-harness cloud orgs use personal      # go back to the user's own
+phone-harness cloud orgs accept INVITE     # join the organization an invitation is for
+```
+
+- **Which one is in use.** `cloud orgs` marks it with `*`. `cloud whoami`
+  prints an `org` line when it is not the user's own; with no such line the
+  commands act in the user's own organization.
+- **Choosing one.** `cloud orgs use ORG` saves the choice for this install's
+  `cloud login` sign-in (`cloud.org`). `PHONE_HARNESS_ORG`, set to an id from
+  `cloud orgs`, names the organization for one process and wins over the
+  saved choice. A name or an address has to match whole (case does not
+  matter); when it fits more than one organization the command lists them,
+  and the id picks one.
+- **An API key belongs to one organization.** `PHONE_HARNESS_API_KEY` always
+  acts in that one: `cloud orgs use` does not apply to it, and it needs no
+  `PHONE_HARNESS_ORG`.
+- **Invitations.** `cloud orgs` lists the ones waiting for the address the
+  user signs in with, each with the command that accepts it. Only that person
+  can accept, signed in with `cloud login`; an API key cannot. Accept an
+  invitation, or switch organization, only when the user asks.
+- **A phone belongs to the organization it was started in.** Stop it before
+  switching to another one.
+- **Errors.** `this account is in no organization with that id` means the
+  saved choice, or `PHONE_HARNESS_ORG`, names an organization the account is
+  not in, or is no longer in. `cloud orgs` still answers and lists the ids:
+  set the variable to one of them or unset it, or forget a saved choice with
+  `cloud orgs use personal`. `Only this organization's owner can do that`
+  means the user's role there is not enough: tell them, and do not look for
+  a way around it.
+
 ## Android
 
 The phone is reached over adb - a USB phone if plugged in, else the paired

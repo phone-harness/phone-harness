@@ -14,6 +14,7 @@ import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 SUPPORT = str(Path(__file__).resolve().parent / "support")
@@ -24,7 +25,7 @@ if SUPPORT not in sys.path:
 import browser_recorder
 browser_recorder.install()
 
-from phone_harness import telemetry  # noqa: E402
+from phone_harness import cloud, run, telemetry  # noqa: E402
 
 FAKE_ADB = r'''#!/bin/sh
 # Locked until `shell unlock CODE`; state is a file next to this script.
@@ -69,6 +70,22 @@ def _fake_resolve(c, body):
     return {**body, "platform": "android", "kind": "emulator"}
 
 
+def org_row(n, name=None, role="member", personal=False, owner="a@b.c"):
+    """One organization as GET /orgs lists it. The caller's own is `personal`."""
+    return {"id": "org_" + f"{n:024x}", "name": name, "role": role, "personal": personal,
+            "owner": {"email": owner, "name": None}}
+
+
+def invite_row(n, org, role="member", by="boss@acme.test", days=7):
+    """An invitation to `org`, waiting for the address the caller signs in with."""
+    return {"id": "inv_" + f"{n:024x}", "role": role, "state": "open",
+            "expires_at": time.time() + 86400 * days, "email": "a@b.c", "invited_by": by,
+            "organization": {"id": org["id"], "name": org["name"], "owner": org["owner"]}}
+
+
+NO_SUCH_ORG = {"error": "No such organization", "code": "no_such_organization"}
+
+
 class FakeCloud(BaseHTTPRequestHandler):
     sessions, profile, polls, posts, keys = {}, {}, {}, [], []
     requests = []                 # (method, path, headers with lowercase names)
@@ -78,6 +95,32 @@ class FakeCloud(BaseHTTPRequestHandler):
     control_url = None            # set: an iPhone's control grant points here
     available = None              # set: replaces the synthesized catalog
     fail = None                   # set: POST /sessions returns this instead
+    orgs = None                   # set: the organizations the caller is in, their own first.
+                                  # Unset is an API from before organizations: no /orgs, no
+                                  # `org` in /me, and X-Phone-Harness-Org means nothing to it
+    invites = []                  # the invitations GET /orgs lists
+    accepts = []                  # (invite id, raw body) of each POST /invites/{id}/accept
+    teams = True
+    key_org = None                # set: the id of the organization an API key (pck_...) belongs to
+    api_keys = []                 # what GET /me/keys lists
+
+    def _accept(self, invite_id, token):
+        c = FakeCloud
+        if token.startswith("pck_"):
+            return self._send(403, {"code": "sign_in_required"})
+        if not c.teams:
+            return self._send(403, {"code": "teams_unavailable"})
+        invite = next((i for i in c.invites if i["id"] == invite_id), None)
+        if invite is None:
+            return self._send(404, {"code": "no_such_invite"})
+        if invite["expires_at"] < time.time():
+            return self._send(410, {"code": "invite_expired"})
+        if any(o["id"] == invite["organization"]["id"] for o in c.orgs):
+            return self._send(409, {"code": "already_member"})
+        joined = {**invite["organization"], "role": invite["role"], "personal": False}
+        c.orgs.append(joined)
+        c.invites.remove(invite)
+        return self._send(200, {"organization": joined})
 
     def _oauth(self, path, form):
         c = FakeCloud
@@ -123,9 +166,27 @@ class FakeCloud(BaseHTTPRequestHandler):
         c.requests.append((m, path, {k.lower(): v for k, v in self.headers.items()}))
         if path.startswith("/oauth/"):
             return self._oauth(path, dict(urllib.parse.parse_qsl(raw.decode())))
-        if self.headers.get("Authorization", "")[7:] not in c.valid:
+        token = self.headers.get("Authorization", "")[7:]
+        if token not in c.valid:
             return self._send(401, {"error": "unauthorized"})
         body = json.loads(raw) if raw else {}
+        # A request acts in one organization: the one its header names, else
+        # an API key's, else the caller's own. One the caller is not in is a
+        # 404 on every route, and an empty header names none of them.
+        acting = None
+        if c.orgs is not None:
+            named = self.headers.get("X-Phone-Harness-Org")
+            if named is None:
+                named = c.key_org if token.startswith("pck_") and c.key_org else c.orgs[0]["id"]
+            acting = next((o for o in c.orgs if o["id"] == named), None)
+            if acting is None:
+                return self._send(404, NO_SUCH_ORG)
+            if (m, path) == ("GET", "/orgs"):
+                return self._send(200, {"organizations": c.orgs, "invites": c.invites,
+                                        "teams": c.teams})
+            if m == "POST" and path.startswith("/invites/") and path.endswith("/accept"):
+                c.accepts.append((path.split("/")[2], raw))
+                return self._accept(path.split("/")[2], token)
         if (m, path) == ("GET", "/me") and c.forbid:
             return self._send(403, {"error": "beta access required", "code": "beta_access_required"})
         if (m, path) == ("GET", "/me"):
@@ -140,7 +201,14 @@ class FakeCloud(BaseHTTPRequestHandler):
                   "session_limit": 3, "profile": c.profile,
                   "unnamed": dict(UNNAMED),
                   "available": _fake_catalog(c)}
+            if acting:
+                # In somebody else's organization the account is that
+                # organization's; the email stays the caller's own.
+                me.update(org={k: acting[k] for k in ("id", "name", "role", "personal")},
+                          teams=c.teams, uid="u1" if acting["personal"] else "u-" + acting["id"][-4:])
             return self._send(200, me)
+        if (m, path) == ("GET", "/me/keys"):
+            return self._send(200, c.api_keys)
         if (m, path) == ("POST", "/sessions"):
             c.keys.append(self.headers.get("Idempotency-Key"))
             c.posts.append(body)
@@ -306,6 +374,8 @@ class CloudCli(unittest.TestCase):
         FakeCloud.control_url = None
         FakeCloud.available = None
         FakeCloud.fail = None
+        FakeCloud.orgs, FakeCloud.invites, FakeCloud.accepts, FakeCloud.teams = None, [], [], True
+        FakeCloud.key_org, FakeCloud.api_keys = None, []
         FakeControl.launch_error = None
         FakeCloud.profile = {"id": "prof-1", "state": "stored", "session": None,
                              "saved_at": time.time() - 7200}
@@ -321,7 +391,7 @@ class CloudCli(unittest.TestCase):
                     "PHONE_HARNESS_CLOUD_OAUTH_ISSUER": f"http://127.0.0.1:{self.server.server_port}",
                     "PHONE_HARNESS_CLOUD_OAUTH_CLIENT_ID": "cli-client"}
         for name in ("PHONE_HARNESS_API_KEY", "ANDROID_SERIAL", "PHONE_HARNESS_PLATFORM",
-                     "PHONE_HARNESS_SESSION", "BROWSER"):
+                     "PHONE_HARNESS_SESSION", "BROWSER", "PHONE_HARNESS_ORG", "PHONE_HARNESS_CLOUD_ORG"):
             self.env.pop(name, None)
         browser_recorder.recorder.reset()
 
@@ -1526,6 +1596,516 @@ class CloudCli(unittest.TestCase):
         self.assertTrue(saved[state_at:].startswith("stored"))
         self.assertEqual(temporary.index("android"), header.index("PLATFORM"))
         self.assertIn("temporary", temporary[header.index("NOTE"):])
+
+    # --- organizations ---------------------------------------------------------
+
+    def team(self, *more):
+        """An API with organizations: the caller's own, unnamed, then `more`."""
+        FakeCloud.orgs = [org_row(1, role="owner", personal=True), *more]
+        return FakeCloud.orgs
+
+    def api_requests(self):
+        """(path, headers) of what reached the API. The sign-in's own requests are left out."""
+        return [(p, h) for _, p, h in FakeCloud.requests if not p.startswith("/oauth/")]
+
+    def org_sent(self):
+        """The organization each of those named. None is no header at all."""
+        return [h.get("x-phone-harness-org") for _, h in self.api_requests()]
+
+    def saved_org(self):
+        path = Path(self.home.name) / "config" / "config.json"
+        return (json.loads(path.read_text()).get("cloud") or {}).get("org") if path.exists() else None
+
+    def marked(self, listing):
+        """The ids `cloud orgs` put its * on."""
+        return [line.split()[-1] for line in listing.splitlines() if line.startswith("*")]
+
+    def in_process(self, **env):
+        """This test's environment for a call made in this process: its
+        throwaway home, and no organization but the one named here."""
+        return mock.patch.dict(os.environ, {**self.env, **env}, clear=True)
+
+    def test_an_install_that_chose_no_organization_sends_no_header_at_all(self):
+        """The promise to everyone who does nothing new. The header is absent,
+        not empty: this fake, like the service, takes an empty one for an
+        organization nobody is in."""
+        self.team(org_row(0xa, "Acme"))
+        signed_in = self.login()
+        self.assertNotIn("organization", signed_in.stdout)
+        for args in (["cloud"], ["cloud", "whoami"], ["cloud", "ls"], ["cloud", "keys"],
+                     ["cloud", "orgs"], ["cloud", "start", "--no-watch"], ["cloud", "stop"]):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        FakeCloud.valid.add("pck_ci")
+        for env in ({"PHONE_HARNESS_API_KEY": "pck_ci"}, {"PHONE_HARNESS_ORG": ""},
+                    {"PHONE_HARNESS_ORG": "  "}):
+            r = self.run_cli("cloud", "whoami", env=env)
+            self.assertEqual(r.returncode, 0, (env, r.stderr))
+        sent = self.api_requests()
+        self.assertGreater(len(sent), 10)
+        for path, headers in sent:
+            self.assertNotIn("x-phone-harness-org", headers, path)
+        self.assertIsNone(self.saved_org())
+
+    def test_phone_harness_org_goes_with_every_request_whatever_the_credential(self):
+        acme = self.team(org_row(0xa, "Acme"))[1]["id"]
+        self.login()
+        FakeCloud.requests = []
+        env = {"PHONE_HARNESS_ORG": acme}
+        for args in (["cloud"], ["cloud", "whoami"], ["cloud", "ls"], ["cloud", "keys"],
+                     ["cloud", "start", "--no-watch"], ["cloud", "stop"]):
+            r = self.run_cli(*args, env=env)
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        self.assertGreater(len(self.org_sent()), 8)
+        self.assertEqual(set(self.org_sent()), {acme})
+        FakeCloud.requests = []
+        FakeCloud.valid.add("pck_ci")
+        key = {"PHONE_HARNESS_API_KEY": "pck_ci", "PHONE_HARNESS_ORG": f" {acme}\n"}
+        r = self.run_cli("cloud", "whoami", env=key)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.org_sent(), [acme])              # the value, without the space around it
+
+    def test_the_saved_organization_goes_with_the_sign_in_and_never_with_an_api_key(self):
+        _own, acme, other = (o["id"] for o in self.team(org_row(0xa, "Acme"), org_row(0xb, "Other")))
+        self.login()
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", acme).returncode, 0)
+        self.assertEqual(self.saved_org(), acme)
+        FakeCloud.requests = []
+        for args in (["cloud", "whoami"], ["cloud", "ls"], ["cloud", "start", "--no-watch"],
+                     ["cloud", "stop"]):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        self.assertGreater(len(self.org_sent()), 6)
+        self.assertEqual(set(self.org_sent()), {acme})
+
+        # An API key carries its own organization: the saved one stays behind.
+        FakeCloud.requests = []
+        FakeCloud.valid.add("pck_ci")
+        key = {"PHONE_HARNESS_API_KEY": "pck_ci"}
+        for args in (["cloud", "whoami"], ["cloud", "ls"]):
+            r = self.run_cli(*args, env=key)
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        self.assertEqual([p for p, _ in self.api_requests()], ["/me", "/me", "/sessions"])
+        for path, headers in self.api_requests():
+            self.assertEqual(headers["authorization"], "Bearer pck_ci")
+            self.assertNotIn("x-phone-harness-org", headers, path)
+
+        # The variable wins over the saved choice, goes with a key too, and
+        # leaves what was saved alone.
+        FakeCloud.requests = []
+        self.assertEqual(self.run_cli("cloud", "ls", env={"PHONE_HARNESS_ORG": other}).returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "ls", env={**key, "PHONE_HARNESS_ORG": other}).returncode, 0)
+        self.assertEqual(self.org_sent(), [other] * 4)
+        self.assertEqual(self.saved_org(), acme)
+
+    def test_orgs_lists_them_and_marks_the_one_in_use(self):
+        own, acme, dana = self.team(org_row(0xa, "Acme", "admin", owner="boss@acme.test"),
+                                    org_row(0xd, None, "member", owner="dana@example.com"))
+        self.login()
+        r = self.run_cli("cloud", "orgs")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [
+            "   NAME                             ROLE    ID",
+            f"*  Personal                         owner   {own['id']}",
+            f"   Acme                             admin   {acme['id']}",
+            f"   dana@example.com's organization  member  {dana['id']}"])
+        # The saved choice moves the mark, and the variable moves it for one process.
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "Acme").returncode, 0)
+        self.assertEqual(self.marked(self.run_cli("cloud", "orgs").stdout), [acme["id"]])
+        there = self.run_cli("cloud", "orgs", env={"PHONE_HARNESS_ORG": dana["id"]})
+        self.assertEqual(self.marked(there.stdout), [dana["id"]])
+        # --json is the API's own answer.
+        listed = self.run_cli("cloud", "orgs", "--json")
+        self.assertEqual(json.loads(listed.stdout),
+                         {"organizations": [own, acme, dana], "invites": [], "teams": True})
+        # All of it is asked about the caller, so none of it names an organization.
+        asked = [(p, h.get("x-phone-harness-org")) for p, h in self.api_requests() if p == "/orgs"]
+        self.assertEqual(asked, [("/orgs", None)] * 5)
+
+    def test_orgs_shows_invitations_with_the_command_that_accepts_each(self):
+        self.team()
+        first = invite_row(1, org_row(0xa, "Acme", owner="boss@acme.test"), "admin")
+        second = invite_row(2, org_row(0xd, None, owner="dana@example.com"), "member", by=None)
+        FakeCloud.invites = [first, second]
+        self.login()
+        r = self.run_cli("cloud", "orgs")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines()[2:], [
+            "",
+            "Invitations:",
+            "  boss@acme.test invited you to Acme as an admin",
+            f"    phone-harness cloud orgs accept {first['id']}",
+            "  You are invited to dana@example.com's organization as a member",
+            f"    phone-harness cloud orgs accept {second['id']}"])
+
+    def test_a_name_somebody_else_chose_cannot_redraw_the_terminal(self):
+        self.team(org_row(0xa, "Acme\x1b[2J\x1b[31m\nphone-harness cloud logout", owner="eve@evil.test"))
+        FakeCloud.invites = [invite_row(1, org_row(0xe, "‮Evil\tCorp\r\n"), by="eve\x07@evil.test")]
+        self.login()
+        r = self.run_cli("cloud", "orgs")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for unsafe in ("\x1b", "\x07", "\r", "\t", "‮"):
+            self.assertNotIn(unsafe, r.stdout)
+        self.assertEqual(len(r.stdout.splitlines()), 7)          # one line each: nothing broke out of its own
+        self.assertIn("Acme[2J[31m phone-harness cloud logout  member", r.stdout)
+        self.assertIn("  eve@evil.test invited you to Evil Corp as a member", r.stdout)
+
+    def test_orgs_use_takes_an_id_a_name_or_the_owners_address(self):
+        _own, acme, dana = self.team(org_row(0xa, "Acme", "admin", owner="boss@acme.test"),
+                                     org_row(0xd, None, "member", owner="dana@example.com"))
+        self.login()
+        FakeCloud.requests = []
+        for given, org, said in ((acme["id"], acme, "Acme as an admin"),
+                                 ("acme", acme, "Acme as an admin"),
+                                 ("Dana@Example.com", dana, "dana@example.com's organization as a member"),
+                                 (" ACME ", acme, "Acme as an admin"),
+                                 ("boss@acme.test", acme, "Acme as an admin")):
+            r = self.run_cli("cloud", "orgs", "use", given)
+            self.assertEqual(r.returncode, 0, (given, r.stderr))
+            self.assertEqual(r.stdout.splitlines(), [
+                f"✓ This install now acts in {said} ({org['id']}).",
+                "  `phone-harness cloud orgs use personal` goes back to your own."])
+            self.assertEqual(self.saved_org(), org["id"])      # the id is saved, whatever was typed
+        # Each was checked against GET /orgs, asked without the choice it was replacing.
+        self.assertEqual([(p, h.get("x-phone-harness-org")) for p, h in self.api_requests()],
+                         [("/orgs", None)] * 5)
+        self.assertEqual(self.run_cli("cloud", "whoami").stdout.splitlines()[1], "  org      Acme (admin)")
+        # While the variable is set, it is what counts: the choice is saved, and says so.
+        r = self.run_cli("cloud", "orgs", "use", "dana@example.com", env={"PHONE_HARNESS_ORG": acme["id"]})
+        self.assertEqual(self.saved_org(), dana["id"])
+        self.assertIn("PHONE_HARNESS_ORG is set, and wins over this choice until it is unset.", r.stdout)
+
+    def test_orgs_use_personal_forgets_the_choice(self):
+        own, _acme = self.team(org_row(0xa, "Acme"))
+        self.login()
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "acme").returncode, 0)
+        FakeCloud.requests = []
+        for word in ("personal", "Personal"):
+            r = self.run_cli("cloud", "orgs", "use", word)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "✓ This install now acts in your own organization.")
+            self.assertIsNone(self.saved_org())
+        self.assertEqual(FakeCloud.requests, [])                # nothing is asked, so it works whatever is wrong
+        self.assertEqual(self.run_cli("cloud", "whoami").returncode, 0)
+        self.assertEqual(self.org_sent(), [None])
+        # The caller's own organization, named by its id, is the same thing: nothing is saved.
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "acme").returncode, 0)
+        r = self.run_cli("cloud", "orgs", "use", own["id"])
+        self.assertEqual(r.stdout.strip(), "✓ This install now acts in your own organization.")
+        self.assertIsNone(self.saved_org())
+
+    def test_orgs_use_refuses_what_is_not_exactly_one_organization(self):
+        own, acme, twin = self.team(org_row(0xa, "Acme", "admin", owner="boss@acme.test"),
+                                    org_row(0xb, "Acme", "member", owner="other@acme.test"))
+        self.login()
+        both = self.run_cli("cloud", "orgs", "use", "acme")
+        self.assertEqual(both.returncode, 1)
+        self.assertEqual(both.stderr.splitlines(), [
+            "'acme' matches 2 organizations. Pass the id of one.",
+            "   NAME  ROLE    ID",
+            f"   Acme  admin   {acme['id']}",
+            f"   Acme  member  {twin['id']}"])
+        none = self.run_cli("cloud", "orgs", "use", "nope")
+        self.assertEqual(none.returncode, 1)
+        self.assertEqual(none.stderr.splitlines()[0], "'nope' is not an organization this account is in.")
+        for org in (own, acme, twin):                           # the choices
+            self.assertIn(org["id"], none.stderr)
+        self.assertNotIn("invitation", none.stderr)
+        part = self.run_cli("cloud", "orgs", "use", "acm")      # a part of a name is not guessed at
+        self.assertIn("'acm' is not an organization this account is in.", part.stderr)
+        self.assertEqual(both.stdout + none.stdout + part.stdout, "")
+        self.assertIsNone(self.saved_org())
+        # An organization the account was only invited to is not one of its own yet.
+        FakeCloud.invites = [invite_row(1, org_row(0xc, "Later"))]
+        waiting = self.run_cli("cloud", "orgs", "use", "later")
+        self.assertEqual(waiting.returncode, 1)
+        self.assertEqual(waiting.stderr.splitlines()[-1],
+                         "An invitation is accepted before its organization can be used: "
+                         "`phone-harness cloud orgs` lists the ones waiting.")
+        self.assertIsNone(self.saved_org())
+
+    def test_an_api_key_has_nothing_to_choose_and_the_list_marks_its_organization(self):
+        _own, acme = self.team(org_row(0xa, "Acme"))
+        FakeCloud.valid.add("pck_ci")
+        key = {"PHONE_HARNESS_API_KEY": "pck_ci"}
+        r = self.run_cli("cloud", "orgs", "use", "acme", env=key)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stderr.strip(),
+                         "PHONE_HARNESS_API_KEY is set, and an API key acts in the one organization it "
+                         "belongs to, so there is nothing to choose. Unset it to choose one for "
+                         "`phone-harness cloud login`.")
+        self.assertEqual(FakeCloud.requests, [])
+        self.assertIsNone(self.saved_org())
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "personal", env=key).returncode, 0)
+        # Which organization a key belongs to is the service's to say.
+        FakeCloud.key_org = acme["id"]
+        listed = self.run_cli("cloud", "orgs", env=key)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(self.marked(listed.stdout), [acme["id"]])
+        self.assertEqual(self.org_sent(), [None, None])
+
+    def test_orgs_accept_joins_and_says_how_to_switch(self):
+        self.team()
+        acme = org_row(0xa, "Acme", owner="boss@acme.test")
+        invite = invite_row(1, acme, "admin")
+        FakeCloud.invites = [invite]
+        self.login()
+        FakeCloud.requests = []
+        r = self.run_cli("cloud", "orgs", "accept", invite["id"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "✓ Joined Acme as an admin. To act in it: "
+                                           f"phone-harness cloud orgs use {acme['id']}")
+        self.assertEqual(FakeCloud.accepts, [(invite["id"], b"{}")])
+        [(path, headers)] = self.api_requests()
+        self.assertEqual((path, headers["content-type"]), (f"/invites/{invite['id']}/accept", "application/json"))
+        self.assertNotIn("x-phone-harness-org", headers)
+        self.assertIsNone(self.saved_org())                     # joining is not switching
+        # The command it printed does switch.
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", acme["id"]).returncode, 0)
+        listed = self.run_cli("cloud", "orgs")
+        self.assertEqual(self.marked(listed.stdout), [acme["id"]])
+        self.assertNotIn("Invitations", listed.stdout)
+
+    def test_orgs_accept_says_why_an_invitation_cannot_be_accepted(self):
+        _own, acme = self.team(org_row(0xa, "Acme"))
+        late = invite_row(2, org_row(0xb, "Late"), days=-1)
+        again = invite_row(3, acme)
+        fresh = invite_row(4, org_row(0xc, "Fresh"))
+        FakeCloud.invites = [late, again, fresh]
+        FakeCloud.valid.add("pck_ci")
+        self.login()
+        cases = [
+            ("inv_" + "f" * 24, {},
+             "No invitation 'inv_ffffffffffffffffffffffff' is waiting for the address you are signed in "
+             "with: `phone-harness cloud orgs` lists the ones that are."),
+            (late["id"], {}, "That invitation has expired: ask whoever sent it for a new one."),
+            (again["id"], {},
+             "You are already in that organization: `phone-harness cloud orgs` lists it, and "
+             "`phone-harness cloud orgs use` switches to it."),
+            (fresh["id"], {"PHONE_HARNESS_API_KEY": "pck_ci"},
+             "Joining an organization needs `phone-harness cloud login`: an invitation is accepted by "
+             "the person it was sent to, not by an API key."),
+        ]
+        for given, env, said in cases:
+            with self.subTest(said=said[:24]):
+                r = self.run_cli("cloud", "orgs", "accept", given, env=env)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertEqual(r.stderr.strip(), said)
+                self.assertEqual(r.stdout, "")
+        FakeCloud.teams = False
+        r = self.run_cli("cloud", "orgs", "accept", fresh["id"])
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertEqual(r.stderr.strip(),
+                         "Teams are not available to this account yet, so it cannot join an organization.")
+        self.assertEqual(len(FakeCloud.orgs), 2)                # nobody joined anything
+        self.assertEqual(len(FakeCloud.accepts), 5)             # and each was the service's answer, not a guess
+
+    def test_orgs_usage_for_words_it_does_not_take(self):
+        for args in (["orgs", "use"], ["orgs", "use", "a", "b"], ["orgs", "use", " "], ["orgs", "accept"],
+                     ["orgs", "accept", "inv_1", "inv_2"], ["orgs", "join"], ["orgs", "use", "a", "--json"],
+                     ["orgs", "accept", "inv_1", "--json"], ["orgs", "--json", "--json"]):
+            r = self.run_cli("cloud", *args)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn("Usage: phone-harness cloud orgs [--json]", r.stderr)
+            self.assertEqual(r.stdout, "")
+        self.assertEqual(FakeCloud.requests, [])
+        self.assertIn("phone-harness cloud orgs use ORG|personal", self.run_cli("cloud", "--help").stdout)
+
+    def test_whoami_names_the_organization_only_when_it_is_somebody_elses(self):
+        self.login()
+        before = self.run_cli("cloud", "whoami").stdout          # an API from before organizations
+        self.assertNotIn("org", before)
+        _own, acme, dana = self.team(org_row(0xa, "Acme", "admin"),
+                                     org_row(0xd, None, "member", owner="dana@example.com"))
+        self.assertEqual(self.run_cli("cloud", "whoami").stdout, before)     # the caller's own: not a word more
+        there = self.run_cli("cloud", "whoami", env={"PHONE_HARNESS_ORG": acme["id"]})
+        lines = there.stdout.splitlines()
+        self.assertEqual(lines[1], "  org      Acme (admin)")
+        self.assertEqual(lines[:1] + lines[2:], before.splitlines())
+        # /me does not say whose an unnamed organization is, so its id stands for it.
+        unnamed = self.run_cli("cloud", "whoami", env={"PHONE_HARNESS_ORG": dana["id"]})
+        self.assertEqual(unnamed.stdout.splitlines()[1], f"  org      {dana['id']} (member)")
+        as_json = json.loads(self.run_cli("cloud", "whoami", "--json",
+                                          env={"PHONE_HARNESS_ORG": acme["id"]}).stdout)
+        self.assertEqual(as_json["org"], {"id": acme["id"], "name": "Acme", "role": "admin", "personal": False})
+
+    def test_keys_say_who_made_each_only_when_the_api_does(self):
+        self.login()
+        made = time.time() - 2 * 86400 - 60
+        plain = [{"key_hash": "0123456789abcdef0123", "hint": "pck_...cdef", "created": made, "label": "ci"},
+                 {"key_hash": "fedcba9876543210fedc", "hint": "pck_...3210", "created": made, "label": None}]
+        FakeCloud.api_keys = plain
+        old = self.run_cli("cloud", "keys")                      # an API from before organizations
+        self.assertEqual(old.returncode, 0, old.stderr)
+        self.assertEqual(old.stdout, "HASH           KEY              CREATED        LABEL\n"
+                                     "0123456789ab   pck_...cdef      2 days ago     ci\n"
+                                     "fedcba987654   pck_...3210      2 days ago     \n")
+        # Rows that name nobody are the same table, whatever else they carry.
+        FakeCloud.api_keys = [{**row, "created_by": None, "mine": False} for row in plain]
+        self.assertEqual(self.run_cli("cloud", "keys").stdout, old.stdout)
+        FakeCloud.api_keys = [
+            {**plain[0], "created_by": {"uid": "u1", "email": "a@b.c"}, "mine": True},
+            {**plain[1], "created_by": {"uid": "u2", "email": "dana@example.com"}, "mine": False},
+            {**plain[0], "key_hash": "aaaa0000aaaa0000", "created_by": {"uid": "u3", "email": None}},
+            {**plain[0], "key_hash": "bbbb0000bbbb0000", "created_by": None, "mine": False}]
+        new = self.run_cli("cloud", "keys")
+        self.assertEqual(new.returncode, 0, new.stderr)
+        self.assertEqual(new.stdout, "HASH           KEY              CREATED        BY               LABEL\n"
+                                     "0123456789ab   pck_...cdef      2 days ago     you              ci\n"
+                                     "fedcba987654   pck_...3210      2 days ago     dana@example.com \n"
+                                     "aaaa0000aaaa   pck_...cdef      2 days ago     u3               ci\n"
+                                     "bbbb0000bbbb   pck_...cdef      2 days ago     -                ci\n")
+        self.assertEqual(json.loads(self.run_cli("cloud", "keys", "--json").stdout), FakeCloud.api_keys)
+
+    def test_a_choice_that_no_longer_holds_is_explained_and_can_be_put_right(self):
+        _own, acme = self.team(org_row(0xa, "Acme"))
+        self.login()
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "acme").returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "start", "--no-watch").returncode, 0)
+        FakeCloud.orgs.remove(acme)                             # removed from it, with a phone running there
+        said = (f"This install is set to organization '{acme['id']}', and this account is in no "
+                "organization with that id: `phone-harness cloud orgs` lists the ones it is in, and "
+                "`phone-harness cloud orgs use personal` goes back to your own.")
+        for args in (["cloud"], ["cloud", "whoami"], ["cloud", "ls"], ["cloud", "keys"],
+                     ["cloud", "start", "--no-watch"], ["cloud", "stop"], ["cloud", "stop", "--all"]):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertEqual(r.stderr.strip(), said, args)
+        # `stop` did not take that 404 for the session's: the phone is not forgotten.
+        state = json.loads((Path(self.home.name) / "state" / "cloud.json").read_text())
+        self.assertEqual(state["session"]["sid"], "sid001")
+        self.assertIn("sid001", FakeCloud.sessions)
+        # The commands that show the choice and put it right still answer.
+        listed = self.run_cli("cloud", "orgs")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(self.marked(listed.stdout), [])
+        self.assertEqual(listed.stdout.splitlines()[-1], said)
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "personal").returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "stop").returncode, 0)
+        self.assertEqual(FakeCloud.sessions, {})
+        # Named by the variable instead, it says which variable to unset.
+        r = self.run_cli("cloud", "ls", env={"PHONE_HARNESS_ORG": "org_gone"})
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stderr.strip(),
+                         "PHONE_HARNESS_ORG is 'org_gone', and this account is in no organization with that "
+                         "id: `phone-harness cloud orgs` lists the ones it is in, so set PHONE_HARNESS_ORG "
+                         "to one of those or unset it.")
+
+    def test_bare_cloud_explains_what_the_api_refuses_like_any_other_command(self):
+        """It is the first thing run when something is wrong, a choice that no
+        longer holds included, and it used to answer with a traceback."""
+        self.login()
+        FakeCloud.forbid = True
+        refused = self.run_cli("cloud")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("isn't enabled for phones yet", refused.stderr)
+        down = self.run_cli("cloud", env={"PHONE_HARNESS_CLOUD_API": "http://127.0.0.1:1"})
+        self.assertEqual(down.returncode, 1)
+        self.assertIn("Could not reach http://127.0.0.1:1", down.stderr)
+        for r in (refused, down):
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(len(r.stderr.splitlines()), 1)
+
+    def test_signing_in_is_not_refused_by_an_organization_chosen_before(self):
+        _own, acme = self.team(org_row(0xa, "Acme"))
+        self.login()
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "acme").returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "logout").returncode, 0)
+        self.assertEqual(self.saved_org(), acme["id"])           # a preference of this install, like cloud.phone
+        FakeCloud.orgs.remove(acme)                             # whoever signs in next is not in it
+        FakeCloud.requests = []
+        r = self.run_cli("cloud", "login", "--no-browser")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Signed in as a@b.c", r.stdout)
+        self.assertIn(f"This install is set to act in organization '{acme['id']}': "
+                      "`phone-harness cloud orgs` shows it.", r.stdout)
+        self.assertEqual(self.org_sent(), [None])               # who signed in is asked without it
+        self.assertEqual(self.auth()["access_token"], "at-1")
+
+    def test_an_organization_no_header_can_carry_is_refused_before_anything_is_sent(self):
+        self.team()
+        self.login()
+        FakeCloud.requests = []
+        for bad in ("café", "team ✓", "org_1\nX-Other: 1"):
+            r = self.run_cli("cloud", "ls", env={"PHONE_HARNESS_ORG": bad})
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("this account is in no organization with that id", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(len(r.stderr.splitlines()), 1)      # shown escaped, on its one line
+        self.assertEqual(FakeCloud.requests, [])
+
+    def test_an_api_from_before_organizations_says_so(self):
+        self.login()                                            # FakeCloud.orgs is unset
+        for args in (["orgs"], ["orgs", "--json"], ["orgs", "use", "acme"], ["orgs", "accept", "inv_1"]):
+            r = self.run_cli("cloud", *args)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertEqual(r.stderr.strip(),
+                             f"{self.env['PHONE_HARNESS_CLOUD_API']} does not have organizations yet.")
+            self.assertEqual(r.stdout, "")
+        self.assertIsNone(self.saved_org())
+        # To that API the variable is a header it does not read: everything else is as it was.
+        r = self.run_cli("cloud", "whoami", env={"PHONE_HARNESS_ORG": "org_x"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("org", r.stdout)
+
+    def test_what_an_organization_refuses_is_said_as_what_to_do(self):
+        self.login()
+        FakeCloud.fail = (403, {"error": "Only the owner can start this phone", "code": "role_required",
+                                "role": "owner"}, None)
+        r = self.run_cli("cloud", "start", "--no-watch")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stderr.strip(),
+                         "Only this organization's owner can do that (Only the owner can start this phone).")
+        gone = cloud.CloudError(404, dict(NO_SUCH_ORG))
+        refusals = {
+            "role_required": cloud.CloudError(403, {"error": "Members cannot add credit", "code": "role_required",
+                                                    "role": "admin"}),
+            "sign_in_required": cloud.CloudError(403, {"code": "sign_in_required"}),
+            "teams_unavailable": cloud.CloudError(403, {"code": "teams_unavailable"}),
+        }
+        with self.in_process():
+            said = {code: cloud._explain(e) for code, e in refusals.items()}
+            # Nobody here named an organization, so there is nothing to tell them to undo.
+            self.assertEqual(cloud._explain(gone), "No such organization (HTTP 404)")
+        self.assertEqual(said, {
+            # Its words are about credit; it is still not a balance that has run out.
+            "role_required": "Only this organization's owner or an admin can do that (Members cannot add credit).",
+            "sign_in_required": "An API key cannot do that: it takes a person signed in with "
+                                "`phone-harness cloud login`.",
+            "teams_unavailable": "Teams are not available to this account yet."})
+        for sentence in said.values():                          # none is the 403 of an account not enabled yet
+            self.assertNotIn("isn't enabled for phones", sentence)
+            self.assertNotIn("source=cli", sentence)
+        with self.in_process(PHONE_HARNESS_ORG="org_gone"):
+            self.assertIn("PHONE_HARNESS_ORG is 'org_gone'", cloud._explain(gone))
+            # A reservation command does not take it for an API with no reservations, or ask again.
+            with mock.patch.object(cloud, "_api", side_effect=AssertionError("asked again")):
+                reserving = cloud._explain_reservation(gone, rid="rsv_" + "0" * 24)
+        self.assertEqual(reserving, cloud._org_unknown("org_gone", "env:PHONE_HARNESS_ORG"))
+
+    def test_nothing_typed_after_cloud_orgs_is_recorded(self):
+        self.assertEqual(run._telemetry_argv(["cloud", "orgs", "use", "Acme Inc"]),
+                         ["cloud", "orgs", "use", "<redacted>"])
+        self.assertEqual(run._telemetry_argv(["--session", "s1", "cloud", "orgs", "use", "dana@example.com"]),
+                         ["cloud", "orgs", "use", "<redacted>"])
+        self.assertEqual(run._telemetry_argv(["cloud", "orgs", "accept", "inv_" + "0" * 24]),
+                         ["cloud", "orgs", "accept", "<redacted>"])
+        self.assertEqual(run._telemetry_argv(["cloud", "orgs", "use", "org_" + "0" * 24, "--json"]),
+                         ["cloud", "orgs", "use", "<redacted>", "--json"])
+        self.assertEqual(run._telemetry_argv(["cloud", "orgs", "use", "personal"]),
+                         ["cloud", "orgs", "use", "personal"])
+        self.assertEqual(run._telemetry_argv(["cloud", "orgs", "--json"]), ["cloud", "orgs", "--json"])
+        for action in cloud._cloud_parsers()["orgs"]._actions:
+            for flag in action.option_strings:
+                self.assertIn(flag, run._ORG_WORDS)
+        # And over the wire: the address someone typed goes nowhere.
+        self.posthog()
+        self.team(org_row(0xd, None, owner="dana@example.com"))
+        self.login()
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "dana@example.com").returncode, 0)
+        used = self.cli_event(2, subcommand="orgs")
+        self.assertEqual(used["argv"], ["cloud", "orgs", "use", "<redacted>"])
+        self.assertNotIn("dana@example.com", json.dumps(FakePostHog.events))
 
 
 if __name__ == "__main__":

@@ -80,6 +80,7 @@ class HelpAndFlags(unittest.TestCase):
             "phone": "--yes",
             "keys": "--json",
             "history": "--limit",
+            "orgs": "--json",
             "reserve": "--idempotency-key",
             "reservations": "--yes",
         }

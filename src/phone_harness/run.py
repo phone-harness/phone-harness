@@ -152,11 +152,18 @@ def _reservation_argv(words):
     return masked
 
 
+# A `cloud orgs` command line names an organization (its name, its owner's
+# email address or its id) or an invitation. Who someone works with is not
+# telemetry either, so only the command's own words are kept.
+_ORG_WORDS = frozenset({"use", "accept", "personal", "--json", "--help", "-h"})
+
+
 def _telemetry_argv(args):
     """The command line as cli_event records it. `--session SID` is left out:
     the pinned session is the event's session_id. An Android pairing code is
     masked: it is a credential. So is everything free on a reservation
-    command (see _RESERVATION_FLAGS)."""
+    command (see _RESERVATION_FLAGS) and on a `cloud orgs` one (see
+    _ORG_WORDS)."""
     argv, words = [], iter(args)
     for word in words:
         if word == "--session":
@@ -167,6 +174,8 @@ def _telemetry_argv(args):
         argv[2:] = ["<code>" if word.isdigit() else word for word in argv[2:]]
     if argv[:1] == ["cloud"] and argv[1:2] in (["reserve"], ["reservations"]):
         argv[2:] = _reservation_argv(argv[2:])
+    if argv[:2] == ["cloud", "orgs"]:
+        argv[2:] = [word if word in _ORG_WORDS else "<redacted>" for word in argv[2:]]
     return argv
 
 
