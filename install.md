@@ -142,6 +142,11 @@ local check fails it also points at the cloud. Common ones:
   Connect / Mac Locked) — clear it on the Mac, lock the iPhone if it says in use.
 - **iPhone — taps do nothing**: Accessibility missing, or another window stole
   focus (helpers re-activate the window; check for a macOS prompt).
+- **iPhone — permission is on but the doctor still fails**: two common causes.
+  The agent host runs commands in a nested app (Claude Desktop runs Claude
+  Code's own `claude` app), so also turn on the nested app the doctor names. Or macOS holds a stale "denied" record: remove the app with the −
+  button and add it again, or run the `tccutil reset …` command the doctor
+  prints. Details: [setup/ios.md](https://github.com/phone-harness/phone-harness/blob/main/setup/ios.md).
 - **iPhone — `--doctor` says pyobjc missing on an install that works**: it is
   running a different Python than the one that has pyobjc. Re-run the Fast
   Path command, or use the interpreter `pip install -e .` used in a checkout.

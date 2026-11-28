@@ -45,10 +45,13 @@ CLOUD_HINT = ("\nNo working phone here? A cloud phone needs no hardware: "
               "https://github.com/phone-harness/phone-harness/blob/main/setup/api.md")
 
 
-def _host_app():
-    """The app macOS asks about: the outermost .app this process runs under
-    (a terminal, or an agent's own app). Falls back to a description."""
-    found, pid = None, os.getppid()
+def _host_apps():
+    """The .app bundles this process runs under, nearest first, as
+    (name, bundle path) pairs with repeats dropped. Agent hosts can run
+    commands inside a nested, separately signed .app (Claude Desktop runs
+    claude-code's own claude.app), which macOS may treat as its own
+    permission subject (#17)."""
+    apps, pid = [], os.getppid()
     for _ in range(40):
         if pid <= 1:
             break
@@ -59,9 +62,47 @@ def _host_app():
         except (OSError, ValueError, subprocess.SubprocessError):
             break
         if ".app/" in comm:
-            found = comm.split(".app/")[0].rsplit("/", 1)[-1]
+            bundle = comm.split(".app/")[0] + ".app"
+            name = bundle[:-len(".app")].rsplit("/", 1)[-1]
+            if not any(b == bundle for _, b in apps):
+                apps.append((name, bundle))
         pid = int(ppid)
-    return f'"{found}"' if found else "the app that runs this command (your terminal or agent app)"
+    return apps
+
+
+def _bundle_id(bundle):
+    """CFBundleIdentifier from a bundle's Info.plist, or None."""
+    import plistlib
+    try:
+        with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as f:
+            return plistlib.load(f).get("CFBundleIdentifier")
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+
+
+def _host_app(apps=None):
+    """The app macOS asks about: the outermost .app this process runs under
+    (a terminal, or an agent's own app). When a nested app sits between it
+    and this command, that one is named too, because some hosts need the
+    grant on the nested app instead (#17). Falls back to a description."""
+    apps = _host_apps() if apps is None else apps
+    if not apps:
+        return "the app that runs this command (your terminal or agent app)"
+    outer, nearest = apps[-1][0], apps[0][0]
+    if nearest != outer:
+        return (f'"{outer}" (if that alone does not work, also turn on '
+                f'"{nearest}", the app inside it that runs this command)')
+    return f'"{outer}"'
+
+
+def _reset_hint(service, apps=None):
+    """How to clear a stale 'denied' record, which makes macOS skip the
+    permission prompt and keeps flipping the switch from helping (#17)."""
+    apps = _host_apps() if apps is None else apps
+    bid = _bundle_id(apps[-1][1]) if apps else None
+    cmd = f"tccutil reset {service} {bid}" if bid else f"tccutil reset {service} <bundle-id>"
+    return (f"; if it is already on and still fails, remove it with the "
+            f"\u2212 button and add it again, or run `{cmd}`")
 
 
 # --- iPhone: pyobjc -> permissions -> Mirroring -> capture -> OCR -----------
@@ -77,15 +118,17 @@ def _doctor_ios():
         return
 
     from ApplicationServices import AXIsProcessTrusted
-    host = _host_app()
+    apps = _host_apps()
+    host = _host_app(apps)
     _check("Accessibility permission (taps & keystrokes)", AXIsProcessTrusted(),
-           f"System Settings > Privacy & Security > Accessibility: turn on {host}")
+           f"System Settings > Privacy & Security > Accessibility: turn on {host}"
+           f"{_reset_hint('Accessibility', apps)}")
 
     import Quartz as Q
     _check("Screen Recording permission (seeing the phone)",
            bool(Q.CGPreflightScreenCaptureAccess()),
            f"System Settings > Privacy & Security > Screen Recording: turn on {host}, "
-           f"then quit and reopen it")
+           f"then quit and reopen it{_reset_hint('ScreenCapture', apps)}")
 
     from . import mirror
     _check(f"{mirror.APP_NAME} installed", Path(mirror.APP_PATH).exists(),
@@ -112,7 +155,7 @@ def _doctor_ios():
         good = r.returncode == 0 and size > 20_000
         _check(f"window capture works ({size} bytes)", good,
                "capture failed or is blank — Screen Recording permission "
-               "needs a terminal restart to take effect")
+               f"takes effect only after {host} is quit and reopened")
         if good:
             from . import ocr
             n = len(ocr.recognize(path, win))
