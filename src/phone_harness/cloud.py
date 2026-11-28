@@ -16,6 +16,12 @@ Signing in is the browser's job (OAuth device flow); nobody pastes a key.
 PHONE_HARNESS_API_KEY, if set, is used instead: that is for CI, where there
 is no one to click Approve.
 
+Every account is an organization of one, and may be in others whose phones it
+then shares. A request acts in one of them: the caller's own, unless
+PHONE_HARNESS_ORG or `cloud orgs use` (cloud.org in config.json) names
+another, which the request then carries as X-Phone-Harness-Org. An API key
+belongs to one organization and needs neither.
+
 Stdlib only. API reference: https://phone-harness.com/docs
 """
 import argparse
@@ -199,32 +205,97 @@ def _bearer(required=True, force_refresh=False):
     return token
 
 
+# --- which organization ------------------------------------------------------
+
+ORG_HEADER = "X-Phone-Harness-Org"
+
+
+def _org():
+    """The organization this install names in its requests: (id, where it was
+    named), or (None, None) for the caller's own. Where is `env:NAME` or
+    `file`, as config.lookup says it.
+
+    PHONE_HARNESS_ORG names it for one process, whatever the credential. What
+    `cloud orgs use` saved (cloud.org) is for the `cloud login` sign-in only:
+    an API key carries its own organization. With neither, nothing is sent and
+    the service acts in the caller's own organization, as it did before there
+    were organizations.
+    """
+    named = (os.environ.get("PHONE_HARNESS_ORG") or "").strip()
+    if named:
+        return named, "env:PHONE_HARNESS_ORG"
+    if os.environ.get("PHONE_HARNESS_API_KEY"):
+        return None, None
+    saved, source = config.lookup("cloud.org")
+    saved = str(saved or "").strip()
+    return (saved, source) if saved else (None, None)
+
+
+def _org_header():
+    """The header that names that organization, or no header at all."""
+    named, source = _org()
+    if not named:
+        return {}
+    if not (named.isascii() and named.isprintable()):
+        # Not an id, and not something a header can carry.
+        sys.exit(_org_unknown(named, source))
+    return {ORG_HEADER: named}
+
+
+def _org_unknown(named, source):
+    """What to do about a named organization the account is not in: it never
+    was, the organization is gone, or the account was removed from it."""
+    if source.startswith("env:"):
+        return (f"{source[4:]} is {named!r}, and this account is in no organization with that id: "
+                "`phone-harness cloud orgs` lists the ones it is in, so set "
+                f"{source[4:]} to one of those or unset it.")
+    return (f"This install is set to organization {named!r}, and this account is in no "
+            "organization with that id: `phone-harness cloud orgs` lists the ones it is in, "
+            "and `phone-harness cloud orgs use personal` goes back to your own.")
+
+
 # --- http --------------------------------------------------------------------
 
-def _api(method, path, body=None, token=None, headers=None, timeout=40):
-    """-> parsed JSON. CloudError for an HTTP error, OSError if unreachable."""
+def _api(method, path, body=None, token=None, headers=None, timeout=40, org=True):
+    """-> parsed JSON. CloudError for an HTTP error, OSError if unreachable.
+
+    `org=False` leaves the organization out. That is for what is asked about
+    the caller and not about an organization (the list of them, an
+    invitation): a choice that no longer holds must not refuse the commands
+    that show it and fix it.
+    """
     try:
-        return _request(method, path, body, token or _bearer(), headers, timeout)
+        return _request(method, path, body, token or _bearer(), headers, timeout, org)
     except CloudError as e:
         # The access token can be refused before its stated expiry (clock
         # skew, a revoked grant): one refresh, one retry, then it is a 401.
         fresh = None if token or e.status != 401 else _bearer(required=False, force_refresh=True)
         if not fresh:
             raise
-        return _request(method, path, body, fresh, headers, timeout)
+        return _request(method, path, body, fresh, headers, timeout, org)
 
 
-def _me(token=None):
-    """GET /me: the signed-in account. Its uid is what this install's
-    telemetry is linked to."""
-    me = _api("GET", "/me", token=token)
-    telemetry.link_user(me.get("uid"))
+def _me(token=None, org=True):
+    """GET /me: the signed-in account, or in another organization that
+    organization's account with the caller's own email and name.
+
+    This install's telemetry is linked to the person using it, so to the uid
+    of an answer about their own account only. In somebody else's
+    organization the uid is that organization's account, which is another
+    person's: linking to it would file what this install does under them.
+    The link made at `cloud login`, which asks with no organization named,
+    is the one that stays."""
+    me = _api("GET", "/me", token=token, org=org)
+    place = me.get("org")
+    if not (isinstance(place, dict) and place.get("personal") is False):
+        telemetry.link_user(me.get("uid"))
     return me
 
 
-def _request(method, path, body, token, headers, timeout):
+def _request(method, path, body, token, headers, timeout, org=True):
     h = {"Authorization": f"Bearer {token}", "Accept": "application/json",
-         "User-Agent": USER_AGENT, **telemetry.cloud_headers(), **(headers or {})}
+         "User-Agent": USER_AGENT, **telemetry.cloud_headers(),
+         **(_org_header() if org else {}), **(headers or {})}
     data = None
     if body is not None:
         h["Content-Type"] = "application/json"
@@ -248,6 +319,20 @@ def _explain(e):
     """A CloudError, as the next thing the user should do."""
     if e.status == 401:
         return "This machine is signed out. Run: phone-harness cloud login"
+    # What an organization refuses comes first: none of it is about credit,
+    # or about an account that is not enabled yet, whatever its words say.
+    if e.code == "no_such_organization":
+        named, source = _org()
+        if named:
+            return _org_unknown(named, source)
+    if e.status == 403 and e.code == "role_required":
+        who = "owner" if e.body.get("role") == "owner" else "owner or an admin"
+        return f"Only this organization's {who} can do that ({e})."
+    if e.status == 403 and e.code == "sign_in_required":
+        return ("An API key cannot do that: it takes a person signed in with "
+                "`phone-harness cloud login`.")
+    if e.status == 403 and e.code == "teams_unavailable":
+        return "Teams are not available to this account yet."
     if e.status == 403 and e.code == "account_blocked":
         return f"This account is blocked from starting phones ({e})."
     if e.status in (402, 403) and (
@@ -852,6 +937,14 @@ def _ago(ts):
     return "just now"
 
 
+def _plain(text):
+    """Words somebody else chose (an organization's name, an address), safe
+    to print on one line: no line breaks, and none of the control or
+    invisible characters that redraw a terminal or pass for this CLI's own
+    output."""
+    return "".join(ch for ch in " ".join(str(text or "").split()) if ch.isprintable())
+
+
 def _resolve_sid(given):
     """A session id, a unique prefix of one, or (None) the attached session."""
     if given is None:
@@ -936,7 +1029,9 @@ def _login(args):
         sys.exit("Sign-in timed out. Run `phone-harness cloud login` again when you can "
                  f"sign in. No account yet? {SIGNUP}")
     try:
-        me = _me(token=tok["access_token"])
+        # Who signed in, not where they act: an organization named for this
+        # install, perhaps by the last account, must not refuse a sign-in.
+        me = _me(token=tok["access_token"], org=False)
     except CloudError as e:
         sys.exit(f"Signed in, but the Phone Harness API refused the sign-in: {_explain(e)}")
     _store_tokens(tok, email=me.get("email"))
@@ -945,6 +1040,11 @@ def _login(args):
     _save_state(state)
     print(f"{term.mark()} Signed in as {me.get('email') or me.get('uid')}")
     _print_account(me)
+    named = _org()[0]
+    if named:
+        # The lines above are the account's own. What runs next is not.
+        print(term.note(f"This install is set to act in organization {named!r}: "
+                        "`phone-harness cloud orgs` shows it."))
     print("\nStart your phone with: phone-harness cloud start")
     return 0
 
@@ -981,6 +1081,12 @@ def _credit(me):
 
 
 def _print_account(me):
+    org = me.get("org")
+    # Only somebody else's organization is worth a line: the account under
+    # it is then that organization's, not the caller's own.
+    if isinstance(org, dict) and not org.get("personal", True):
+        role = _plain(org.get("role"))
+        print(f"  org      {_org_name(org)}" + (f" ({role})" if role else ""))
     print(f"  credit   {_credit(me)}")
     print(f"  phone    {_describe_profile(me.get('profile') or {})}")
     if not me.get("can_rent", True):
@@ -1347,7 +1453,9 @@ def _stop(args):
             _api("DELETE", f"/sessions/{sid}")
             print(f"{term.mark()} Session {sid} ended.")
         except CloudError as e:
-            if e.status != 404:
+            # A 404 for the organization says nothing about the session: it
+            # may still be running, and is not to be forgotten.
+            if e.status != 404 or e.code == "no_such_organization":
                 raise
             print(f"Session {sid} was already gone.")
         _detach(sid)
@@ -1720,11 +1828,28 @@ def _keys(args):
     if _flag(args, "--json"):
         print(json.dumps(keys, indent=2))
         return 0
-    print(f"{'HASH':<14} {'KEY':<16} {'CREATED':<14} LABEL")
-    for k in keys:
+    # In an organization the list can hold teammates' keys, so each row says
+    # whose it is. An API from before organizations names nobody, and the
+    # table is then what it always was.
+    head, made_by = "", [""] * len(keys)
+    if any(k.get("created_by") for k in keys):
+        makers = [_key_maker(k) for k in keys]
+        width = max(len("BY"), *map(len, makers))
+        head, made_by = f"{'BY':<{width}} ", [f"{maker:<{width}} " for maker in makers]
+    print(f"{'HASH':<14} {'KEY':<16} {'CREATED':<14} {head}LABEL")
+    for k, by in zip(keys, made_by):
         print(f"{k['key_hash'][:12]:<14} "
-              f"{k.get('hint') or '':<16} {_ago(k.get('created')):<14} {k.get('label') or ''}")
+              f"{k.get('hint') or '':<16} {_ago(k.get('created')):<14} {by}{k.get('label') or ''}")
     return 0
+
+
+def _key_maker(key):
+    """Who made an API key: 'you', else their address."""
+    if key.get("mine"):
+        return "you"
+    by = key.get("created_by")
+    by = by if isinstance(by, dict) else {}
+    return _plain(by.get("email") or by.get("uid")) or "-"
 
 
 def _history(args):
@@ -2014,7 +2139,9 @@ def _explain_reservation(e, rid=None, retry=None):
     is; its `code` decides what is added. `retry` is the command that safely
     repeats a request Stripe did not finish. A 403 here is never the "not
     enabled for phones yet" that `_explain` makes of one."""
-    if e.status == 401 or e.code == "account_blocked":
+    # What the organization refuses is not about a reservation either: a 404
+    # for the organization would otherwise read as an API with no reservations.
+    if e.status == 401 or e.code in ("account_blocked", "no_such_organization", "role_required"):
         return _explain(e)
     said = str(e)
     if e.status == 404 and rid and (said == _NO_SUCH_RESERVATION or _reservations_live()):
@@ -2260,6 +2387,208 @@ def _reservations(args):
     return 0
 
 
+# --- organizations -----------------------------------------------------------
+#
+# Which organizations the caller is in, which one this install acts in, and
+# the invitations waiting for the address they sign in with. All of it is
+# asked about the caller, so none of it names an organization (`org=False`):
+# these are the commands that show a wrong choice and put it right.
+
+ORGS_USAGE = (
+    "Usage: phone-harness cloud orgs [--json]\n"
+    "       phone-harness cloud orgs use ORG|personal\n"
+    "       phone-harness cloud orgs accept INVITE")
+
+
+def _org_name(org):
+    """What an organization is called: its name, else whose it is."""
+    name = _plain(org.get("name"))
+    if name:
+        return name
+    if org.get("personal"):
+        return "Personal"
+    owner = org.get("owner")
+    owner = owner if isinstance(owner, dict) else {}
+    whose = _plain(owner.get("email") or owner.get("name"))
+    if whose:
+        return f"{whose}'s organization"
+    return _plain(org.get("id")) or "an organization"
+
+
+def _as_role(role):
+    """' as a member', ' as an admin'; nothing when the API names no role."""
+    role = _plain(role)
+    if not role:
+        return ""
+    return f" as {'an' if role[0] in 'aeiou' else 'a'} {role}"
+
+
+def _format_orgs(orgs, in_use=None):
+    """Text table of organizations, sized to its cells like `cloud ls`.
+    `*` is on the one this install's requests act in."""
+    header = ["", "NAME", "ROLE", "ID"]
+    body = [["*" if in_use and org.get("id") == in_use else "", _org_name(org),
+             _plain(org.get("role")) or "-", _plain(org.get("id"))] for org in orgs]
+    if not body:
+        return ""
+    widths = [max(len(header[i]), *(len(cells[i]) for cells in body)) for i in range(len(header))]
+    widths[0] = max(widths[0], 1)
+
+    def render(cells):
+        padded = [cells[i].ljust(widths[i]) for i in range(len(cells) - 1)]
+        padded.append(cells[-1])
+        return "  ".join(padded).rstrip()
+
+    return "\n".join([render(header), *(render(cells) for cells in body)])
+
+
+def _no_orgs_yet(e):
+    """A 404 with no code for one of these routes is the route itself missing."""
+    if e.status == 404 and not e.code:
+        return f"{_target('API')} does not have organizations yet."
+    return None
+
+
+def _listed_orgs():
+    """GET /orgs -> (the API's answer, the organizations the caller is in with
+    their own first, the invitations waiting for them)."""
+    try:
+        found = _api("GET", "/orgs", org=False)
+    except CloudError as e:
+        sys.exit(_no_orgs_yet(e) or _explain(e))
+    shown = found if isinstance(found, dict) else {}
+    orgs = [o for o in shown.get("organizations") or [] if isinstance(o, dict) and o.get("id")]
+    invites = [i for i in shown.get("invites") or [] if isinstance(i, dict) and i.get("id")]
+    return found, orgs, invites
+
+
+def _org_in_use(orgs):
+    """The id of the organization this install's requests act in, or None
+    when it names one that is not among `orgs`."""
+    named = _org()[0]
+    if named:
+        return named if any(o["id"] == named for o in orgs) else None
+    if os.environ.get("PHONE_HARNESS_API_KEY"):
+        # A key belongs to one organization, and only the service knows which.
+        return (_me().get("org") or {}).get("id")
+    return next((o["id"] for o in orgs if o.get("personal")), None)
+
+
+def _match_org(orgs, query):
+    """The organizations `query` names: by id, else by name or by the owner's
+    email address. Exact, case-insensitive. No partial matches."""
+    q = _plain(query).casefold()
+    by_id = [o for o in orgs if str(o["id"]).casefold() == q]
+    if by_id:
+        return by_id
+
+    def owner_email(org):
+        owner = org.get("owner")
+        return _plain(owner.get("email")) if isinstance(owner, dict) else ""
+
+    return [o for o in orgs if q and q in (_plain(o.get("name")).casefold(),
+                                           owner_email(o).casefold())]
+
+
+def _use_org(given):
+    """Save which organization this install's sign-in acts in, or forget it."""
+    if given.strip().casefold() == "personal":
+        chosen = None
+    else:
+        if os.environ.get("PHONE_HARNESS_API_KEY"):
+            sys.exit("PHONE_HARNESS_API_KEY is set, and an API key acts in the one organization "
+                     "it belongs to, so there is nothing to choose. Unset it to choose one for "
+                     "`phone-harness cloud login`.")
+        _found, orgs, invites = _listed_orgs()
+        hits = _match_org(orgs, given)
+        if not hits:
+            waiting = ("\nAn invitation is accepted before its organization can be used: "
+                       "`phone-harness cloud orgs` lists the ones waiting." if invites else "")
+            sys.exit(f"{given!r} is not an organization this account is in.\n"
+                     f"{_format_orgs(orgs)}{waiting}")
+        if len(hits) > 1:
+            sys.exit(f"{given!r} matches {len(hits)} organizations. Pass the id of one.\n"
+                     f"{_format_orgs(hits)}")
+        chosen = hits[0]
+    if chosen is None or chosen.get("personal"):
+        # The caller's own needs no naming: forgetting the choice sends
+        # nothing, which is what an install that never chose one does.
+        config.unset("cloud.org")
+        print(f"{term.mark()} This install now acts in your own organization.")
+    else:
+        config.set("cloud.org", chosen["id"])
+        print(f"{term.mark()} This install now acts in {_org_name(chosen)}"
+              f"{_as_role(chosen.get('role'))} ({_plain(chosen['id'])}).")
+        print(term.note("  `phone-harness cloud orgs use personal` goes back to your own."))
+    if (os.environ.get("PHONE_HARNESS_ORG") or "").strip():
+        print(term.note("  PHONE_HARNESS_ORG is set, and wins over this choice until it is unset."))
+    return 0
+
+
+def _explain_invite(e, invite):
+    """A CloudError from accepting an invitation, as what to do next."""
+    if e.code == "no_such_invite":
+        return (f"No invitation {invite!r} is waiting for the address you are signed in with: "
+                "`phone-harness cloud orgs` lists the ones that are.")
+    if e.code == "invite_expired":
+        return "That invitation has expired: ask whoever sent it for a new one."
+    if e.code == "already_member":
+        return ("You are already in that organization: `phone-harness cloud orgs` lists it, "
+                "and `phone-harness cloud orgs use` switches to it.")
+    if e.code == "sign_in_required":
+        return ("Joining an organization needs `phone-harness cloud login`: an invitation is "
+                "accepted by the person it was sent to, not by an API key.")
+    if e.code == "teams_unavailable":
+        return "Teams are not available to this account yet, so it cannot join an organization."
+    return _no_orgs_yet(e) or _explain(e)
+
+
+def _accept_invite(given):
+    try:
+        joined = _api("POST", f"/invites/{urllib.parse.quote(given, safe='')}/accept", {},
+                      org=False)
+    except CloudError as e:
+        sys.exit(_explain_invite(e, given))
+    org = joined.get("organization") if isinstance(joined, dict) else None
+    org = org if isinstance(org, dict) else {}
+    switch = (f" To act in it: phone-harness cloud orgs use {_plain(org['id'])}"
+              if org.get("id") else "")
+    print(f"{term.mark()} Joined {_org_name(org)}{_as_role(org.get('role'))}.{switch}")
+    return 0
+
+
+def _orgs(args):
+    args = list(args)
+    as_json = _flag(args, "--json")
+    if any(a.startswith("-") for a in args):
+        sys.exit(ORGS_USAGE)
+    if args[:1] in (["use"], ["accept"]):
+        if as_json or len(args) != 2 or not args[1].strip():
+            sys.exit(ORGS_USAGE)
+        return _use_org(args[1]) if args[0] == "use" else _accept_invite(args[1])
+    if args:
+        sys.exit(ORGS_USAGE)
+    found, orgs, invites = _listed_orgs()
+    if as_json:
+        print(json.dumps(found, indent=2))
+        return 0
+    named, source = _org()
+    in_use = _org_in_use(orgs)
+    print(_format_orgs(orgs, in_use) or "No organizations.")
+    if named and not in_use:
+        print(term.err(_org_unknown(named, source), sys.stdout))
+    if invites:
+        print("\nInvitations:")
+    for invite in invites:
+        to = invite.get("organization")
+        to = _org_name(to) if isinstance(to, dict) else "an organization"
+        who = _plain(invite.get("invited_by"))
+        lead = f"{who} invited you to" if who else "You are invited to"
+        print(f"  {lead} {to}{_as_role(invite.get('role'))}")
+        print(term.note(f"    phone-harness cloud orgs accept {_plain(invite.get('id'))}"))
+    return 0
+
+
 # --- CLI (phone-harness cloud ...) -------------------------------------------
 
 CLI_USAGE = """Usage:
@@ -2288,6 +2617,12 @@ CLI_USAGE = """Usage:
   phone-harness cloud phone [reset --yes]      the saved Android. reset --yes wipes its stored state
   phone-harness cloud keys [create [LABEL] | revoke HASH]   API keys, for CI
   phone-harness cloud history [-n NUM] [--json]
+  phone-harness cloud orgs [--json]            the organizations this account is in (* = the one this
+                                               install acts in), and the invitations waiting for it
+  phone-harness cloud orgs use ORG|personal    act in another organization with this install's sign-in.
+                                               ORG is its id, its name or its owner's email address;
+                                               personal goes back to your own
+  phone-harness cloud orgs accept INVITE       join the organization an invitation is for
   phone-harness cloud reserve --type iphone|iphone-esim --plan monthly|annual
                               [--qty N] --use-case TEXT [--first-name NAME] [--last-name NAME]
                               [--open] [--json] [--idempotency-key KEY]
@@ -2307,6 +2642,9 @@ CLI_USAGE = """Usage:
 Every command takes --session SID, or PHONE_HARNESS_SESSION, and so do helper
 scripts: that pins one phone for this process. With neither, helpers follow the
 attached session (the last start, or cloud use). SID may be a unique prefix.
+PHONE_HARNESS_ORG names the organization for one process, whatever the
+credential: an id from cloud orgs. It wins over cloud orgs use. An API key
+belongs to one organization, so cloud orgs use does not apply to it.
 PHONE_HARNESS_CLOUD_API, _OAUTH_ISSUER and _OAUTH_CLIENT_ID point the CLI
 at a Phone Harness instance of your own; unset, it is the public cloud.
 They may live in a .env file at the repo root or in the agent workspace (never committed).
@@ -2314,7 +2652,7 @@ They may live in a .env file at the repo root or in the agent workspace (never c
 
 _COMMANDS = {"login": _login, "logout": _logout, "whoami": _whoami, "start": _start,
              "stop": _stop, "ls": _ls, "show": _show, "use": _use, "watch": _watch, "open": _open,
-             "phone": _phone, "keys": _keys, "history": _history,
+             "phone": _phone, "keys": _keys, "history": _history, "orgs": _orgs,
              "reserve": _reserve, "reservations": _reservations}
 
 
@@ -2417,6 +2755,18 @@ def _cloud_parsers():
     history.add_argument("--json", action="store_true", help="print the sessions as JSON")
     parsers["history"] = history
 
+    orgs = make(
+        "orgs", ORGS_USAGE[len("Usage: "):],
+        "The organizations this account is in, and the invitations waiting for the "
+        "address it signs in with. * marks the organization this install acts in. "
+        "use ORG saves another one for this install's sign-in: ORG is its id, its name "
+        "or its owner's email address, and personal goes back to your own. accept "
+        "INVITE joins the organization an invitation is for. PHONE_HARNESS_ORG names "
+        "an organization for one process and wins over use. An API key belongs to one "
+        "organization, and use does not apply to it.")
+    orgs.add_argument("--json", action="store_true", help="print the API's answer as JSON")
+    parsers["orgs"] = orgs
+
     reserve = make(
         "reserve", RESERVE_USAGE[len("Usage: "):],
         "Ask for cloud iPhones before the account has them. Prints the quote the API "
@@ -2473,16 +2823,17 @@ def _dispatch(args):
     pinned = _option(args, "--session")
     if pinned:
         os.environ["PHONE_HARNESS_SESSION"] = pinned
-    if not args:
-        return _status(args)
-    if args[0] in ("-h", "--help"):
+    if args[:1] in (["-h"], ["--help"]):
         print(CLI_USAGE)
         return 0
-    fn = _COMMANDS.get(args[0])
+    # Bare `cloud` is the status. It is what someone runs to see what is
+    # wrong, so what the API refuses is explained there as it is anywhere.
+    fn = _COMMANDS.get(args[0]) if args else _status
     if fn is None:
         print(CLI_USAGE)
         return 2
-    term.reject_unknown_flags(_cloud_parsers()[args[0]], args[1:])
+    if args:
+        term.reject_unknown_flags(_cloud_parsers()[args[0]], args[1:])
     try:
         return fn(args[1:])
     except CloudError as e:
