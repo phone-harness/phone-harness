@@ -541,7 +541,10 @@ class DoctorNamesTheHostApp(unittest.TestCase):
             return mock.Mock(stdout=chain[int(cmd[-1])])
         with mock.patch.object(admin.os, "getppid", return_value=50), \
                 mock.patch.object(admin.subprocess, "run", fake):
-            self.assertEqual(admin._host_app(), '"Agent"')
+            hint = admin._host_app()
+        # The outer app comes first; the nested one is the fallback (#17).
+        self.assertTrue(hint.startswith('"Agent"'), hint)
+        self.assertIn('also turn on "Helper"', hint)
 
     def test_no_app_falls_back(self):
         from phone_harness import admin
