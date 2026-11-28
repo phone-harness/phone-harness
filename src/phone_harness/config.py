@@ -28,7 +28,9 @@ variables that are not already set: a place
 for per-machine overrides such as PHONE_HARNESS_CLOUD_API, never committed.
 Resolving that workspace creates it from the packaged defaults when the
 directory does not exist; an existing directory is not modified. An
-install keeps it under the home directory, not the install prefix.
+install keeps it under the home directory, not the install prefix. Both
+encodings Windows tools produce are read: UTF-8, with or without a BOM, and
+UTF-16 marked by one — what `>` in PowerShell 5.1 writes.
 `get("android.poke_every")` looks at PHONE_HARNESS_ANDROID_POKE_EVERY, then
 config.json, then DEFAULTS. Env vars are per-call overrides; nothing
 requires them.
@@ -49,19 +51,50 @@ VERSION = 1
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _decode_env(raw):
+    """Text from a `.env` file's bytes, honouring a leading byte-order mark.
+
+    A BOM is not hypothetical: `>` and `Out-File` in Windows PowerShell 5.1
+    write UTF-16LE, and Notepad writes UTF-8 with one. The mark is the only
+    thing that differs between these, so read it and decode rather than guess;
+    a file with no mark is UTF-8, as documented. A NUL character means the
+    bytes were not text in either encoding (BOM-less UTF-16 reaches here that
+    way), and becomes a ValueError rather than a key the environment refuses."""
+    text = None
+    for bom, encoding in ((b"\xff\xfe", "utf-16-le"),
+                          (b"\xfe\xff", "utf-16-be")):
+        if raw.startswith(bom):
+            text = raw[len(bom):].decode(encoding)
+            break
+    if text is None:
+        text = raw.decode("utf-8-sig")
+    if "\x00" in text:
+        raise ValueError("not text in a known encoding")
+    return text
+
+
 def _load_env_files():
     """KEY=value lines from <repo>/.env and <agent-workspace>/.env into the
     environment, without overriding what is already set. No dependency; a
     `#` line is a comment, quotes around a value are stripped.
 
     The workspace path is the same one the helpers use, so a missing
-    directory is seeded before its `.env` is read."""
+    directory is seeded before its `.env` is read.
+
+    A file that cannot be decoded is a warning naming it and the encoding to
+    use, then skipped: this runs at import, so failing here would stop every
+    command over a file that is only a convenience."""
     from .workspace import agent_workspace
     workspace = agent_workspace()
     for path in (_REPO_ROOT / ".env", workspace / ".env"):
         try:
-            text = path.read_text(encoding="utf-8-sig")
+            text = _decode_env(path.read_bytes())
         except OSError:
+            continue
+        except (UnicodeDecodeError, ValueError) as e:
+            print(f"phone-harness: ignoring {path} ({e}); "
+                  "save it as UTF-8, the default, or as UTF-16 with a BOM",
+                  file=sys.stderr)
             continue
         for line in text.splitlines():
             line = line.strip()
