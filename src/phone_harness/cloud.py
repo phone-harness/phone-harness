@@ -277,10 +277,18 @@ def _api(method, path, body=None, token=None, headers=None, timeout=40, org=True
 
 def _me(token=None, org=True):
     """GET /me: the signed-in account, or in another organization that
-    organization's account with the caller's own email and name. Its uid is
-    what this install's telemetry is linked to."""
+    organization's account with the caller's own email and name.
+
+    This install's telemetry is linked to the person using it, so to the uid
+    of an answer about their own account only. In somebody else's
+    organization the uid is that organization's account, which is another
+    person's: linking to it would file what this install does under them.
+    The link made at `cloud login`, which asks with no organization named,
+    is the one that stays."""
     me = _api("GET", "/me", token=token, org=org)
-    telemetry.link_user(me.get("uid"))
+    place = me.get("org")
+    if not (isinstance(place, dict) and place.get("personal") is False):
+        telemetry.link_user(me.get("uid"))
     return me
 
 

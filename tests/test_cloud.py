@@ -204,7 +204,7 @@ class FakeCloud(BaseHTTPRequestHandler):
             if acting:
                 # In somebody else's organization the account is that
                 # organization's; the email stays the caller's own.
-                me.update(org={k: acting[k] for k in ("id", "name", "role", "personal")},
+                me.update(org={k: acting[k] for k in ("id", "name", "role", "personal", "owner")},
                           teams=c.teams, uid="u1" if acting["personal"] else "u-" + acting["id"][-4:])
             return self._send(200, me)
         if (m, path) == ("GET", "/me/keys"):
@@ -1922,12 +1922,38 @@ class CloudCli(unittest.TestCase):
         lines = there.stdout.splitlines()
         self.assertEqual(lines[1], "  org      Acme (admin)")
         self.assertEqual(lines[:1] + lines[2:], before.splitlines())
-        # /me does not say whose an unnamed organization is, so its id stands for it.
+        # An organization nobody has named is called by whose it is.
         unnamed = self.run_cli("cloud", "whoami", env={"PHONE_HARNESS_ORG": dana["id"]})
-        self.assertEqual(unnamed.stdout.splitlines()[1], f"  org      {dana['id']} (member)")
+        self.assertEqual(unnamed.stdout.splitlines()[1], "  org      dana@example.com's organization (member)")
         as_json = json.loads(self.run_cli("cloud", "whoami", "--json",
                                           env={"PHONE_HARNESS_ORG": acme["id"]}).stdout)
-        self.assertEqual(as_json["org"], {"id": acme["id"], "name": "Acme", "role": "admin", "personal": False})
+        self.assertEqual(as_json["org"], {"id": acme["id"], "name": "Acme", "role": "admin", "personal": False,
+                                          "owner": {"email": "a@b.c", "name": None}})
+        # and by its id when an API says neither a name nor an owner
+        self.assertEqual(cloud._org_name({"id": dana["id"], "name": None, "personal": False}), dana["id"])
+
+    def test_telemetry_stays_linked_to_the_person_not_to_the_organization_they_act_in(self):
+        """In somebody else's organization /me's uid is that organization's
+        account, which is another person's. The install is the caller's: one
+        $identify, at sign-in, with their own uid, and every later event
+        carries that one."""
+        self.posthog()
+        _own, acme = self.team(org_row(0xa, "Acme", "admin"))
+        self.login()
+        self.assertEqual(self.telemetry_state().get("user_id"), "u1")
+        there = self.run_cli("cloud", "whoami", "--json", env={"PHONE_HARNESS_ORG": acme["id"]})
+        self.assertEqual(there.returncode, 0, there.stderr)
+        self.assertEqual(json.loads(there.stdout)["uid"], "u-" + acme["id"][-4:])    # the organization's account
+        self.assertEqual(self.cli_event(2, subcommand="whoami")["user_id"], "u1")
+        self.assertEqual(self.telemetry_state().get("user_id"), "u1")
+        # a second command there, and one back in their own: still the one link
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", acme["id"]).returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "whoami").returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "orgs", "use", "personal").returncode, 0)
+        self.assertEqual(self.run_cli("cloud", "whoami").returncode, 0)
+        events = self.events("cli_event", count=6)
+        self.assertEqual({e["properties"]["user_id"] for e in events}, {"u1"})
+        self.assertEqual([e["distinct_id"] for e in self.events("$identify")], ["u1"])
 
     def test_keys_say_who_made_each_only_when_the_api_does(self):
         self.login()
